@@ -19,7 +19,7 @@ function referenceFrame(resource, delayMs) {
   });
 }
 
-export function createDiscordBot(token, onVoiceLost, { onUtterance, onListeningStopped, isBusy }) {
+export function createDiscordBot(token, onVoiceLost, { onUtterance, onListeningStopped, isBusy, interruptionMode }) {
   const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
   const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Stop } });
   let gateway = 'connecting';
@@ -99,17 +99,19 @@ export function createDiscordBot(token, onVoiceLost, { onUtterance, onListeningS
     const channels = online ? client.channels.cache.filter(canJoin).map((channel) => ({
       id: channel.id, name: channel.name, guild: channel.guild.name,
     })).sort((a, b) => a.guild.localeCompare(b.guild) || a.name.localeCompare(b.name)) : [];
+    const people = active ? (client.guilds.cache.get(active.guildId)?.voiceStates.cache.filter((state) =>
+      state.channelId === active.id && state.id !== client.user?.id && !state.member?.user.bot).size ?? 0) : 0;
     return {
       gateway: online ? 'online' : gateway,
       bot: online ? client.user.username : '',
       channels, voice: active?.connection.state.status ?? 'idle',
       channelId: active?.id ?? null, playing: player.state.status !== AudioPlayerStatus.Idle, voiceError,
-      listening: Boolean(active?.listening), capturing: Boolean(active?.capture),
+      listening: Boolean(active?.listening), capturing: Boolean(active?.capture), people,
       speaker: active?.capture?.speaker ?? player.state.resource?.metadata.speaker ?? null,
     };
   }
 
-  async function join(id) {
+  async function join(id, { listening = true } = {}) {
     if (!client.isReady()) throw new Error('The Discord bot is offline.');
     const channel = client.channels.cache.get(id);
     if (!canJoin(channel)) throw new Error('Choose a voice channel the bot can view, connect to, and speak in.');
@@ -118,9 +120,9 @@ export function createDiscordBot(token, onVoiceLost, { onUtterance, onListeningS
     voiceError = '';
     const connection = joinVoiceChannel({
       channelId: id, guildId: channel.guild.id, adapterCreator: channel.guild.voiceAdapterCreator,
-      selfDeaf: false, selfMute: false, daveEncryption: true,
+      selfDeaf: !listening, selfMute: false, daveEncryption: true,
     });
-    const target = { id, guildId: channel.guild.id, connection, listening: true };
+    const target = { id, guildId: channel.guild.id, connection, listening };
     active = target;
     connection.on('error', () => {
       if (active === target) lost('The Discord voice transport reported an error.');
@@ -150,9 +152,15 @@ export function createDiscordBot(token, onVoiceLost, { onUtterance, onListeningS
         const member = voiceState?.member;
         if (voiceState?.channelId !== id || !member || member.user.bot) return;
 
+        const playing = player.state.resource;
+        const mode = playing && interruptionMode();
+        if (mode === 'finish') return;
+        const overlap = playing ? {
+          mode,
+          stop() { if (player.state.resource === playing) player.stop(true); },
+        } : undefined;
         const speaker = { name: member.displayName, username: member.user.username };
         const capture = { userId, speaker };
-        const playing = player.state.resource;
         target.capture = capture;
         voiceError = '';
         const decodeError = () => { voiceError = 'Discord audio could not be decoded. Try speaking again.'; };
@@ -162,12 +170,14 @@ export function createDiscordBot(token, onVoiceLost, { onUtterance, onListeningS
               if (playing && player.state.resource === playing) return referenceFrame(playing, delay);
             },
             onSpeech() {
-              if (playing && player.state.resource === playing) player.stop(true);
+              if (overlap?.mode === 'any') overlap.stop();
             },
             onTurn(pcm) {
               if (target.capture !== capture) return;
               target.capture = undefined;
-              if (pcm && active === target && target.listening) onUtterance({ pcm, rate: discordInputRate, speaker });
+              if (pcm && active === target && target.listening) {
+                onUtterance({ pcm, rate: discordInputRate, speaker }, overlap);
+              }
             },
             onError: decodeError,
           });

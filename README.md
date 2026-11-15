@@ -44,7 +44,7 @@ npm ci
 npm run discord
 ```
 
-Open [Discord Voice Control](http://127.0.0.1:8767/). You can apply a persona, voice, and playback speed and **Generate preview** before creating a bot. This panel uses the same model server as Voice Lab; it does not launch or restart it. If Voice Lab is using the model, finish its reply or close its browser tab to free up a session. Settings last until the panel process stops. Prompts and previews are not saved to disk.
+Open [Discord Voice Control](http://127.0.0.1:8767/). You can apply conversation guidelines, persona, voice, and playback speed and **Generate preview** before creating a bot. This panel uses the same model server as Voice Lab. If Voice Lab is using the model, finish its reply or close its browser tab to free up a session. Settings last until the panel process stops. Prompts and previews are not saved to disk.
 
 To run the Discord bot:
 
@@ -59,8 +59,12 @@ To run the Discord bot:
    ```
 
    Set `DISCORD_BOT_TOKEN` in that file or in your environment. Never paste it into chat. The panel does not expose a token field or return the token from its API.
-4. When the panel shows **Bot online**, let people in the channel know that the bot will listen, then select the channel and click **Join channel**. Listening starts automatically for anyone in that channel. Speak and pause for about 0.8 seconds to send a turn. To interrupt a reply, start speaking over the bot and keep talking. If people talk over each other, the bot takes the first speaker’s turn. Discord identifies the speaker by account, and the panel shows who is speaking or receiving a reply. The bot keeps each turn in memory for local inference and starts fresh for each reply.
+4. When the panel shows **Bot online**, let people in the channel know that the bot will listen, then select the channel and click **Join channel**. Listening starts automatically. In a group, say something like “DiscoBuddy, what’s the capital of Canada?” in one turn, then pause for about 0.8 seconds. If people talk over each other, the bot takes the first speaker’s turn. Discord identifies the speaker by account, and the panel shows who is speaking or receiving a reply.
 5. **Stop listening** discards an unfinished spoken turn and deafens the bot while it stays joined. Use **Start listening** to resume. **Leave channel** stops all Discord playback and cancels unfinished replies. You can still type a prompt and select **Speak in Discord**.
+
+Under **Conversation**, choose **When to reply** and **Interrupt replies** separately. The default waits for its name in groups and responds normally one on one. Use **Only when called** to require its name for all spoken replies, or **After every spoken turn** for open conversation. By default, interrupt by saying “DiscoBuddy, stop” and pausing, or by starting a new request with its name. Choose **On any sustained speech** for immediate interruption or **Finish each reply** to turn interruption off.
+
+Open **Edit conversation guidelines** to change how replies are phrased. The defaults lead with the answer, skip routine greetings, and keep replies short. Select **Apply settings** to use the changes for the next turn. When the panel checks who was addressed, the local model transcribes the turn in memory. Audio and transcripts are not saved. Each reply starts fresh.
 
 The panel binds to loopback, and there is no public endpoint or tunnel to configure. The bot uses the standard Guilds and Guild Voice States Gateway intents. [Discord voice](https://docs.discord.com/developers/topics/voice-connections) uses a separate voice WebSocket and UDP and requires DAVE end-to-end encryption for regular voice channels. The pinned `@discordjs/voice` release handles DAVE negotiation. If the bot connects to Discord but cannot join voice, verify that the network allows Discord's voice UDP traffic. The test server is needed to verify the real handshake and playback.
 

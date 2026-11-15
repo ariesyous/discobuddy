@@ -2,6 +2,10 @@
 .status-group { justify-content: flex-end; }
 .panels { display: grid; gap: 16px; min-width: 0; }
 #join-note, #voice-error, #listen-status, #listen-error, #settings-status, #activity { margin-top: 10px; }
+.guideline-editor { margin-top: 12px; }
+.guideline-editor summary { color: var(--accent); cursor: pointer; font-size: .85rem; }
+#reset-guidelines { margin-top: 8px; }
+#turn-hint { overflow-wrap: anywhere; }
 #save { margin-top: 16px; width: 100%; }
 #preview-audio { display: block; width: min(100%, 460px); margin-top: 8px; }
 @media (max-width: 400px) {
