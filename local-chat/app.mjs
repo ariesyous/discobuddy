@@ -1,6 +1,6 @@
 import { Playback, decodeRecording, recordMicrophone, waveFile } from './audio.mjs';
 import { openHandsFree } from './hands-free.mjs';
-import { MAX_VOICE_SECONDS, RealtimeSession, VOICES } from './realtime.mjs';
+import { MAX_VOICE_SECONDS, RealtimeSession, replyKey, VOICES } from './realtime.mjs';
 
 const presets = {
   buddy: 'You are Discobuddy, a laid-back friend in voice chat. Give warm, natural replies in one or two short sentences. Ask a follow-up only if it helps.',
@@ -21,6 +21,7 @@ const canHandsFree = Boolean(navigator.mediaDevices?.getUserMedia && globalThis.
 const playbackUrls = new Set();
 const personaKey = 'discobuddy.persona';
 const voiceKey = 'discobuddy.voice';
+const MIN_REPEAT_CHARS = 48;
 const socketUrl = new URL('/v1/realtime', location.href);
 socketUrl.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
 
@@ -32,6 +33,7 @@ let sendTime;
 let handsFree;
 let activeReply;
 let audibleReply;
+let lastAnswer;
 let activePersona = presets.buddy;
 let activeVoice = 'live';
 try { activePersona = (localStorage.getItem(personaKey) ?? activePersona).slice(0, 2400); } catch { /* Storage may be disabled. */ }
@@ -117,7 +119,6 @@ function clearMessages() {
 
 async function newChat() {
   if (phase !== 'idle' || activeReply) return;
-  if (handsFree) handsFree.speechStartedAt = undefined;
   client?.close();
   const persona = ui.persona.value.trim();
   const voice = ui.voice.value;
@@ -127,6 +128,11 @@ async function newChat() {
 
 async function connect({ persona = activePersona, voice = activeVoice, message, error = false } = {}) {
   phase = 'connecting';
+  lastAnswer = undefined;
+  if (handsFree) {
+    handsFree.speechStartedAt = undefined;
+    handsFree.audioChunks = undefined;
+  }
   const next = new RealtimeSession(socketUrl, {
     onDisconnect(error) {
       if (client !== next) return;
@@ -203,6 +209,7 @@ function finishReply(message, reply, speech) {
     reply.firstAudioMs != null && `First audio ${seconds(reply.firstAudioMs)}`,
     `Total ${seconds(reply.totalMs)}`,
     reply.audioSeconds > 0 && `Spoken length ${seconds(reply.audioSeconds * 1000)}`,
+    message.retried && 'Model context reset',
     message.stopReason || (reply.status === 'cancelled' && 'Cancelled'),
     reply.status === 'incomplete' && 'Reply limit reached',
   ].filter(Boolean).join(' · ');
@@ -222,9 +229,13 @@ function cancelReply(reason) {
   }
 }
 
-async function sendTurn({ input, startedAt, speech }) {
+async function sendTurn({ input, startedAt = performance.now(), speech }) {
   if (!client?.ready || activeReply) return;
   const typed = typeof input === 'string';
+  const promptKey = typed ? replyKey(input) : undefined;
+  const earlier = lastAnswer;
+  const newPrompt = !typed || earlier?.promptKey !== promptKey;
+  const avoidReply = earlier?.count >= 2 && newPrompt ? earlier.text : '';
   const inputSeconds = speech ? client.pendingAudioSeconds : typed ? 0 : input.length / (2 * client.inputRate);
   addMessage('user', typed ? input : `Voice message · ${seconds(inputSeconds * 1000)}`);
   const reply = addMessage('buddy', 'Thinking…');
@@ -234,6 +245,7 @@ async function sendTurn({ input, startedAt, speech }) {
   try {
     const options = {
       startedAt,
+      avoidReply,
       onText(text) {
         const follow = atLatest();
         reply.body.textContent = text;
@@ -250,8 +262,40 @@ async function sendTurn({ input, startedAt, speech }) {
         }
       },
     };
-    reply.pending = speech ? client.finishAudio(options) : client.ask(input, options);
-    const result = await reply.pending;
+    const request = () => {
+      reply.pending = speech ? client.finishAudio(options) : client.ask(input, options);
+      return reply.pending;
+    };
+    let result = await request();
+    if (result.repeated) {
+      client.close();
+      await connect({ message: 'Retrying your message in a fresh model session…' });
+      if (!client?.ready) {
+        reply.body.textContent = 'Could not restart the model for this reply.';
+        return;
+      }
+      if (reply.stopReason) {
+        reply.body.textContent = 'Reply cancelled.';
+        activity('Reply cancelled. You can send another message.');
+        return;
+      }
+      if (speech) {
+        for (const pcm of speech.audioChunks) client.appendAudio(pcm, speech.rate);
+      }
+      reply.retried = true;
+      result = await request();
+      if (result.repeated) {
+        lastAnswer = earlier;
+        reply.body.textContent = 'The model still repeated its last reply after retrying.';
+        activity('You can send a new message.', true);
+        return;
+      }
+    }
+    if (result.status !== 'cancelled') {
+      const text = replyKey(result.text);
+      const count = lastAnswer?.text === text && newPrompt ? lastAnswer.count + 1 : 1;
+      lastAnswer = text.length >= MIN_REPEAT_CHARS ? { text, promptKey, count } : undefined;
+    }
     const follow = atLatest();
     finishReply(reply, result, speech);
     if (follow) scrollToLatest();
@@ -288,8 +332,12 @@ async function submitHandsFreeTurn(mode, { at, silenceMs }) {
   try {
     await activeReply?.pending;
     if (handsFree !== mode || client !== session || !session.ready) return;
-    const speech = { durationMs: endedAt - mode.speechStartedAt, silenceMs };
+    const speech = {
+      durationMs: endedAt - mode.speechStartedAt, silenceMs,
+      audioChunks: mode.audioChunks, rate: playback.context.sampleRate,
+    };
     mode.speechStartedAt = undefined;
+    mode.audioChunks = undefined;
     phase = 'idle';
     void sendTurn({ startedAt: endedAt, speech });
   } catch {
@@ -340,13 +388,17 @@ async function toggleHandsFree() {
         if (handsFree !== mode || !mode.listening || phase !== 'idle') return;
         if (event.type === 'speech') {
           mode.speechStartedAt = event.at - event.onsetDelayMs;
+          mode.audioChunks = [];
           cancelReply('Interrupted');
           render();
           activity('Hearing you. Pause to send.');
         }
         if (handsFree !== mode) return;
         try {
-          if (event.pcm.length) client.appendAudio(event.pcm, playback.context.sampleRate);
+          if (event.pcm.length) {
+            client.appendAudio(event.pcm, playback.context.sampleRate);
+            mode.audioChunks.push(event.pcm);
+          }
           if (event.type === 'turn') void submitHandsFreeTurn(mode, event);
         } catch (error) {
           fail(error);
