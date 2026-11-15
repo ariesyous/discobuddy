@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Discobuddy · Discord Voice Control</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/panel.css">
+  <script type="module" src="/app.mjs"></script>
+</head>
+<body>
+  <main class="lab">
+    <header class="masthead">
+      <div class="brand">
+        <div class="mark" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+        <div><h1>Discobuddy</h1><p>Discord Voice Control</p></div>
+      </div>
+      <div class="status-group" role="status">
+        <span id="gateway" class="connection">Checking Discord</span>
+        <span id="model" class="connection">Checking model</span>
+      </div>
+    </header>
+
+    <div class="workspace">
+      <form id="settings" class="persona" aria-labelledby="settings-title">
+        <div class="overline">SETUP</div>
+        <h2 id="settings-title">Bot settings</h2>
+        <p>Set how Discobuddy responds in this panel and in Discord.</p>
+        <label for="preset">Preset</label>
+        <select id="preset">
+          <option value="buddy">Casual buddy</option>
+          <option value="deadpan">Deadpan teammate</option>
+          <option value="coach">Patient coach</option>
+          <option value="blank">No persona</option>
+          <option value="custom">Custom</option>
+        </select>
+        <label for="persona">Persona instructions</label>
+        <textarea id="persona" rows="6" maxlength="2400" placeholder="Try a tone, a role, and how long replies should be."></textarea>
+        <label for="voice">Voice</label>
+        <select id="voice">
+          <option value="live">Original live voice</option>
+          <option value="female">Female</option>
+          <option value="male">Male</option>
+        </select>
+        <label for="speed">Playback speed</label>
+        <select id="speed">
+          <option value="0.75">0.75×</option>
+          <option value="1" selected>1×</option>
+          <option value="1.15">1.15×</option>
+          <option value="1.25">1.25×</option>
+          <option value="1.5">1.5×</option>
+          <option value="1.75">1.75×</option>
+          <option value="2">2×</option>
+        </select>
+        <button id="save" class="primary" disabled>Apply settings</button>
+        <p class="small" id="settings-status" role="status">Waiting for the panel.</p>
+      </form>
+
+      <div class="panels">
+        <section class="persona" aria-labelledby="channel-title">
+          <div class="overline">DISCORD</div>
+          <h2 id="channel-title">Voice connection</h2>
+          <p id="voice-status" role="status">Waiting for the panel.</p>
+          <label for="channel">Server and voice channel</label>
+          <select id="channel" disabled><option value="">No channels available</option></select>
+          <div class="actions">
+            <button id="join" class="primary" type="button" disabled>Join channel</button>
+            <button id="leave" class="secondary" type="button" disabled>Leave channel</button>
+          </div>
+          <p id="join-note" class="small">Joining starts listening to people in the channel. Let them know before you join.</p>
+          <p id="voice-error" class="activity" data-error="true" role="alert" hidden></p>
+          <div class="model">
+            <h2>Talk to DiscoBuddy</h2>
+            <p>Speak in Discord, then pause for a reply. You can speak over DiscoBuddy to interrupt it. Audio is processed locally and isn’t saved.</p>
+            <div class="actions">
+              <button id="listen" class="primary" type="button" disabled>Start listening</button>
+            </div>
+            <p id="listen-status" class="small activity" role="status">Listening is off.</p>
+            <p id="listen-error" class="small activity" data-error="true" role="alert" hidden></p>
+          </div>
+        </section>
+
+        <form id="speech" class="persona" aria-labelledby="speech-title">
+          <div class="overline">LOCAL MODEL · LFM3-AUDIO-2B</div>
+          <h2 id="speech-title">Test a voice reply</h2>
+          <p>Type a prompt and listen here first, or send the generated reply to your joined channel. Each prompt starts fresh.</p>
+          <label for="prompt">Prompt</label>
+          <textarea id="prompt" rows="3" maxlength="600" required placeholder="Say hello to the test server in one short sentence."></textarea>
+          <div class="actions">
+            <button id="preview" class="secondary" value="preview" disabled>Generate preview</button>
+            <button id="speak" class="primary" value="speak" disabled>Speak in Discord</button>
+          </div>
+          <p id="activity" class="small activity" role="status">Waiting for the local model.</p>
+          <audio id="preview-audio" controls preload="none" hidden></audio>
+        </form>
+      </div>
+    </div>
+  </main>
+</body>
+</html>

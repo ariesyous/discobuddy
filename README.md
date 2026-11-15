@@ -35,7 +35,34 @@ For the female and male voices, the client keeps the model's interleaved convers
 
 Run the protocol and PCM checks with `node --test` (Node 22 or later). They don't need a model running. To also exercise both voices against a running local model with a synthesized spoken question and typed turns, set `$env:DISCOBUDDY_TEST_URL = 'http://127.0.0.1:8765'` before running the tests. Use a server with no Voice Lab tab open so both model slots are available. This integration check does not test microphone hardware.
 
-Discord is a separate next step. The voice bridge will need [Discord's DAVE protocol](https://docs.discord.com/developers/topics/voice-connections#end-to-end-encryption-dave-protocol), per-user turn control, and a clear listening notice. It can use the same local model with audio conversion between Discord and these sample rates.
+## Discord Voice Control on Windows
+
+Keep Voice Lab running on port 8765. In a separate PowerShell terminal, from this checkout, use Node.js 22.12 or newer:
+
+```powershell
+npm ci
+npm run discord
+```
+
+Open [Discord Voice Control](http://127.0.0.1:8767/). You can apply a persona, voice, and playback speed and **Generate preview** before creating a bot. This panel uses the same model server as Voice Lab; it does not launch or restart it. If Voice Lab is using the model, finish its reply or close its browser tab to free up a session. Settings last until the panel process stops. Prompts and previews are not saved to disk.
+
+To run the Discord bot:
+
+1. Create an application in the [Discord Developer Portal](https://discord.com/developers/applications). On **Bot**, use **Reset Token** to obtain the bot token. Leave the privileged intents off.
+2. Under **Installation**, enable **Guild Install** and choose **Discord Provided Link**. In the default settings for Guild Install, add the `bot` scope and the **View Channels**, **Connect**, and **Speak** permissions. Open the link and install it to a test server you manage. Check channel permissions if a regular voice channel is missing from the panel. Stage channels are out of scope.
+3. Stop the control panel with Ctrl+C. Copy the example config and edit the ignored file locally:
+
+   ```powershell
+   Copy-Item .env.discord.example .env.discord
+   notepad .env.discord
+   npm run discord
+   ```
+
+   Set `DISCORD_BOT_TOKEN` in that file or in your environment. Never paste it into chat. The panel does not expose a token field or return the token from its API.
+4. When the panel shows **Bot online**, let people in the channel know that the bot will listen, then select the channel and click **Join channel**. Listening starts automatically for anyone in that channel. Speak and pause for about 0.8 seconds to send a turn. To interrupt a reply, start speaking over the bot and keep talking. If people talk over each other, the bot takes the first speaker’s turn. Discord identifies the speaker by account, and the panel shows who is speaking or receiving a reply. The bot keeps each turn in memory for local inference and starts fresh for each reply.
+5. **Stop listening** discards an unfinished spoken turn and deafens the bot while it stays joined. Use **Start listening** to resume. **Leave channel** stops all Discord playback and cancels unfinished replies. You can still type a prompt and select **Speak in Discord**.
+
+The panel binds to loopback, and there is no public endpoint or tunnel to configure. The bot uses the standard Guilds and Guild Voice States Gateway intents. [Discord voice](https://docs.discord.com/developers/topics/voice-connections) uses a separate voice WebSocket and UDP and requires DAVE end-to-end encryption for regular voice channels. The pinned `@discordjs/voice` release handles DAVE negotiation. If the bot connects to Discord but cannot join voice, verify that the network allows Discord's voice UDP traffic. The test server is needed to verify the real handshake and playback.
 
 ### Hands-free latency
 
