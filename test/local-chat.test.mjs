@@ -166,6 +166,66 @@ test('discarding queued speech keeps the session and discarding transmitted spee
   assert.equal(wire.events.at(-1).type, 'input_audio_buffer.append');
 });
 
+test('suppresses repeated live text and audio and releases a valid shorter reply', async (t) => {
+  const { chat, wire } = await start();
+  t.after(() => chat.close());
+  const previous = 'There is a small coffee spill in the kitchen. How is your day going?';
+  const delivered = [];
+  const options = {
+    avoidReply: previous,
+    onText: (text) => delivered.push(text),
+    onAudio: () => delivered.push('audio'),
+  };
+
+  const duplicate = chat.ask('Name a planet with rings.', options);
+  wire.emit('response.output_text.delta', { delta: 'There is a small coffee spill in the kitchen. ' });
+  wire.emit('response.output_audio.delta', { delta: 'AAA=' });
+  wire.emit('response.output_text.delta', { delta: 'How is your day going?' });
+  assert.deepEqual(delivered, []);
+  wire.emit('response.done', { response: { status: 'completed' } });
+  const repeated = await duplicate;
+  assert.equal(repeated.repeated, true);
+  assert.equal(repeated.text, '');
+  assert.deepEqual(repeated.audio, []);
+  assert.deepEqual(delivered, []);
+
+  const shorter = chat.ask('How big was the spill?', options);
+  wire.emit('response.output_text.delta', { delta: 'There is a small coffee spill in the kitchen.' });
+  wire.emit('response.output_audio.delta', { delta: 'AAA=' });
+  assert.deepEqual(delivered, []);
+  wire.emit('response.done', { response: { status: 'completed' } });
+  assert.equal((await shorter).repeated, false);
+  assert.deepEqual(delivered, ['There is a small coffee spill in the kitchen.', 'audio']);
+});
+
+test('waits for a reply to diverge before sending sentences to the selected voice', async (t) => {
+  const server = speechServer();
+  const { chat, wire } = await start('Be a patient coach.', { voice: 'male', request: server.request });
+  t.after(() => chat.close());
+  const options = { avoidReply: 'Good question. We were talking about what spilled in the kitchen.' };
+  const first = chat.ask('Where is Paris?', options);
+  wire.emit('response.output_text.delta', { delta: 'Good question. ' });
+  await new Promise(setImmediate);
+  assert.deepEqual(server.calls, []);
+  wire.emit('response.output_text.delta', { delta: 'Paris is the capital of France.' });
+  await eventually(() => server.calls.length === 1);
+  assert.equal(server.calls[0].input, 'Good question.');
+  wire.emit('response.done', { response: { status: 'completed' } });
+  assert.equal((await first).text, 'Good question. Paris is the capital of France.');
+  assert.deepEqual(server.calls.map(({ input, voice }) => [input, voice]),
+    [['Good question.', 'male'], ['Paris is the capital of France.', 'male']]);
+
+  const cancelled = chat.ask('Go on.', options);
+  wire.emit('response.output_text.delta', { delta: 'Good question. ' });
+  chat.cancel();
+  wire.emit('response.done', { response: { status: 'cancelled' } });
+  const result = await cancelled;
+  assert.equal(result.status, 'cancelled');
+  assert.equal(result.repeated, false);
+  assert.equal(result.text, '');
+  assert.equal(server.calls.length, 2);
+});
+
 test('streams complete sentences in the selected voice, aligns PCM chunks, and uses the new voice in a new session', async (t) => {
   const server = speechServer();
   const { chat, wire } = await start('Be a patient coach.', { voice: 'male', request: server.request });

@@ -1,6 +1,10 @@
 export const MAX_VOICE_SECONDS = 20;
 export const VOICES = ['live', 'female', 'male'];
 
+export function replyKey(text) {
+  return text.trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
 export class RealtimeSession {
   #socket;
   #opening;
@@ -128,12 +132,13 @@ export class RealtimeSession {
     audio.sent = true;
   }
 
-  #respond(prepare, { onText, onAudio, startedAt = performance.now() } = {}) {
+  #respond(prepare, { onText, onAudio, startedAt = performance.now(), avoidReply = '' } = {}) {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => this.#disconnect(new Error('The local model took too long. Start a new chat to try again.')), 120_000);
       this.#turn = {
         resolve, reject, timer, onText, onAudio, startedAt, text: '', audio: [], bytes: 0,
         speechText: '', speechQueue: Promise.resolve(), speechAbort: new AbortController(), textDone: false,
+        checkingReply: replyKey(avoidReply), repeated: false,
       };
       try {
         prepare();
@@ -169,6 +174,35 @@ export class RealtimeSession {
     url.pathname = path;
     url.search = '';
     return url;
+  }
+
+  #deliverText(turn, delta) {
+    if (!delta) return;
+    turn.firstTextMs ??= performance.now() - turn.startedAt;
+    turn.onText?.(turn.text);
+    if (this.#voice === 'live') return;
+
+    turn.speechText += delta;
+    let boundary;
+    while ((boundary = /[.!?]["'”’\)\]]*\s+|\n+/u.exec(turn.speechText))) {
+      const end = boundary.index + boundary[0].length;
+      this.#queueSpeech(turn, turn.speechText.slice(0, end));
+      turn.speechText = turn.speechText.slice(end);
+    }
+  }
+
+  #deliverAudio(turn, bytes) {
+    turn.firstAudioMs ??= performance.now() - turn.startedAt;
+    turn.onAudio?.(bytes, this.outputRate);
+  }
+
+  #releaseReply(turn) {
+    turn.checkingReply = '';
+    this.#deliverText(turn, turn.text);
+    for (const bytes of turn.audio) {
+      if (turn.cancelRequested) break;
+      this.#deliverAudio(turn, bytes);
+    }
   }
 
   #queueSpeech(turn, text) {
@@ -223,9 +257,8 @@ export class RealtimeSession {
         turn.bytes += bytes.length;
         if (turn.bytes > this.outputRate * 2 * 45) throw new Error('The model returned an oversized audio reply.');
         received = true;
-        turn.firstAudioMs ??= performance.now() - turn.startedAt;
         turn.audio.push(bytes);
-        turn.onAudio?.(bytes, this.outputRate);
+        this.#deliverAudio(turn, bytes);
       }
       if (!turn.cancelRequested && (trailing !== undefined || !received)) {
         throw new Error('The speech server returned incomplete audio.');
@@ -240,13 +273,15 @@ export class RealtimeSession {
       if (this.#turn !== turn) return;
       this.#turn = undefined;
       clearTimeout(turn.timer);
+      const held = Boolean(turn.checkingReply);
       turn.resolve({
-        text: turn.text, audio: turn.audio, outputRate: this.outputRate,
-        audioSeconds: turn.bytes / (2 * this.outputRate),
+        text: held ? '' : turn.text, audio: held ? [] : turn.audio, outputRate: this.outputRate,
+        audioSeconds: held ? 0 : turn.bytes / (2 * this.outputRate),
         firstTextMs: turn.firstTextMs, firstAudioMs: turn.firstAudioMs,
         totalMs: performance.now() - turn.startedAt,
         status: turn.cancelRequested ? 'cancelled' : status,
         speechError: turn.speechError,
+        repeated: turn.repeated,
       });
       // Resume a queued microphone turn after both generation and TTS have settled.
       try { this.#flushAudio(); }
@@ -303,35 +338,31 @@ export class RealtimeSession {
 
     const turn = this.#turn;
     if (!turn) return;
-    const elapsed = performance.now() - turn.startedAt;
     if (event.type === 'response.done') {
       turn.textDone = true;
-      if (this.#voice !== 'live' && !turn.cancelRequested) this.#queueSpeech(turn, turn.speechText);
+      if (turn.checkingReply && !turn.cancelRequested) {
+        turn.repeated = replyKey(turn.text) === turn.checkingReply;
+        if (!turn.repeated) this.#releaseReply(turn);
+      }
+      if (this.#voice !== 'live' && !turn.cancelRequested && !turn.repeated) this.#queueSpeech(turn, turn.speechText);
       turn.speechText = '';
       this.#finish(turn, event.response?.status);
     } else if (turn.cancelRequested) {
       // Drain the cancelled response before admitting another turn on the same socket.
       return;
     } else if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') {
-      turn.firstTextMs ??= elapsed;
       turn.text += event.delta;
-      turn.onText?.(turn.text);
-      if (this.#voice !== 'live') {
-        turn.speechText += event.delta;
-        let boundary;
-        while ((boundary = /[.!?]["'”’\)\]]*\s+|\n+/u.exec(turn.speechText))) {
-          const end = boundary.index + boundary[0].length;
-          this.#queueSpeech(turn, turn.speechText.slice(0, end));
-          turn.speechText = turn.speechText.slice(end);
-        }
+      if (!turn.checkingReply) {
+        this.#deliverText(turn, event.delta);
+      } else if (!turn.checkingReply.startsWith(replyKey(turn.text))) {
+        this.#releaseReply(turn);
       }
     } else if (this.#voice === 'live' && event.type === 'response.output_audio.delta' && event.delta) {
       const bytes = Uint8Array.from(atob(event.delta), (char) => char.charCodeAt(0));
       turn.bytes += bytes.length;
       if (bytes.length % 2 || turn.bytes > this.outputRate * 2 * 45) throw new Error('The model returned an invalid or oversized audio reply.');
-      turn.firstAudioMs ??= elapsed;
       turn.audio.push(bytes);
-      turn.onAudio?.(bytes, this.outputRate);
+      if (!turn.checkingReply) this.#deliverAudio(turn, bytes);
     }
   }
 }
