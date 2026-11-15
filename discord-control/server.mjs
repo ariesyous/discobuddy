@@ -15,6 +15,7 @@ const assets = new Map([
   ['/personas.mjs', ['../local-chat/personas.mjs', 'text/javascript']],
 ]);
 const offline = { gateway: 'token needed', bot: '', channels: [], voice: 'idle', channelId: null, playing: false, voiceError: '' };
+const modelError = 'Could not generate speech. Check the local model and try again. If Voice Lab is using the model, let its reply finish or close the tab.';
 
 class RequestError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -50,10 +51,42 @@ export async function createControlServer({
   let job;
   let joining = false;
   let bot;
+  let listenError = '';
   const cancelBroadcast = () => { if (job?.broadcast) job.controller.abort(); };
+  const cancelSpoken = () => {
+    if (job?.spoken) job.controller.abort();
+    listenError = '';
+  };
+
+  async function runReply(input, { broadcast, spoken = false, controller }) {
+    job = { broadcast, spoken, controller };
+    try {
+      const reply = await synthesize(modelPort, input, settings, controller.signal);
+      if (controller.signal.aborted) throw new RequestError(409, 'The reply was cancelled.');
+      if (broadcast) {
+        try { bot.play(reply, spoken); }
+        catch (error) { throw new RequestError(409, error.message); }
+      }
+      return reply;
+    } finally {
+      job = undefined;
+    }
+  }
+
+  function onUtterance(input) {
+    if (job) return;
+    const status = bot.status();
+    if (status.voice !== 'ready' || status.playing || !status.listenerId) return;
+    const controller = new AbortController();
+    listenError = '';
+    void runReply(input, { broadcast: true, spoken: true, controller }).catch((error) => {
+      if (!controller.signal.aborted) listenError = error instanceof RequestError ? error.message : modelError;
+    });
+  }
+
   if (token) {
     const factory = makeBot ?? (await import('./discord.mjs')).createDiscordBot;
-    bot = factory(token, cancelBroadcast);
+    bot = factory(token, cancelBroadcast, { onUtterance, onListeningStopped: cancelSpoken, isBusy: () => Boolean(job) });
   }
   const voiceStatus = () => bot?.status() ?? offline;
   const modelReady = () => fetch(`http://${host}:${modelPort}/health`, { signal: AbortSignal.timeout(1500) })
@@ -72,7 +105,7 @@ export async function createControlServer({
       if (req.method === 'GET') {
         if (path === '/api/status') {
           const ready = await modelReady();
-          return json(res, 200, { ...voiceStatus(), modelReady: ready, busy: Boolean(job), settings });
+          return json(res, 200, { ...voiceStatus(), modelReady: ready, busy: Boolean(job), responding: Boolean(job?.spoken), listenError, settings });
         }
         const asset = assets.get(path);
         if (asset) {
@@ -95,6 +128,15 @@ export async function createControlServer({
           bot?.leave();
           return json(res, 200, { ok: true });
         }
+        if (path === '/api/listen') {
+          if (!bot) throw new RequestError(409, 'Set a bot token and restart the panel first.');
+          if (body.userId !== null && (typeof body.userId !== 'string' || !/^\d{17,20}$/.test(body.userId))) {
+            throw new RequestError(400, 'Choose a speaker from the joined voice channel.');
+          }
+          try { bot.setListener(body.userId); }
+          catch (error) { throw new RequestError(409, error.message); }
+          return json(res, 200, { ok: true });
+        }
         if (path === '/api/join') {
           if (!bot) throw new RequestError(409, 'Set a bot token and restart the panel first.');
           if (joining) throw new RequestError(409, 'A voice join is already in progress.');
@@ -111,31 +153,24 @@ export async function createControlServer({
           const broadcast = path === '/api/speak';
           const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
           if (!prompt || prompt.length > 600) throw new RequestError(400, 'Enter a prompt of up to 600 characters.');
-          if (job) throw new RequestError(409, 'Wait for the current reply to finish generating.');
           const status = voiceStatus();
+          if (job || status.capturing) throw new RequestError(409, 'Wait for the current turn to finish.');
           if (broadcast && (status.voice !== 'ready' || status.playing)) {
             throw new RequestError(409, 'Join a voice channel and wait for any playback to finish.');
           }
           const controller = new AbortController();
           const cancel = () => controller.abort();
           res.once('close', cancel);
-          job = { broadcast, controller };
           try {
-            const reply = await synthesize(modelPort, prompt, settings, controller.signal);
-            if (controller.signal.aborted) throw new RequestError(409, 'The reply was cancelled.');
-            if (broadcast) {
-              try { bot.play(reply); }
-              catch (error) { throw new RequestError(409, error.message); }
-              return json(res, 200, { ok: true });
-            }
+            const reply = await runReply(prompt, { broadcast, controller });
+            if (broadcast) return json(res, 200, { ok: true });
             const wav = Buffer.from(await previewWave(reply));
             return res.writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Length': wav.length }).end(wav);
           } catch (error) {
             if (error instanceof RequestError) throw error;
             if (controller.signal.aborted) throw new RequestError(409, 'The reply was cancelled.');
-            throw new RequestError(503, 'Could not generate speech. Check the local model and try again. If Voice Lab is using the model, let its reply finish or close the tab.');
+            throw new RequestError(503, modelError);
           } finally {
-            job = undefined;
             res.off('close', cancel);
           }
         }

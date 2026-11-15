@@ -4,13 +4,17 @@ const $ = (id) => document.getElementById(id);
 const ui = Object.fromEntries([
   'settings', 'preset', 'persona', 'voice', 'speed', 'save', 'settings-status',
   'gateway', 'model', 'voice-status', 'voice-error', 'channel', 'join', 'leave',
+  'speaker', 'listen', 'listen-status', 'listen-error',
   'speech', 'prompt', 'preview', 'speak', 'activity', 'preview-audio',
 ].map((id) => [id, $(id)]));
 let state;
 let applied;
 let channelKey;
+let speakerKey;
 let voiceAction;
 let voiceRequestError = '';
+let listenPending = false;
+let listenRequestError = '';
 let settingsError = '';
 let saving = false;
 let generating = false;
@@ -72,12 +76,44 @@ function render() {
   const voiceError = voiceRequestError || (!voiceAction && state?.voiceError) || '';
   ui['voice-error'].hidden = !voiceError;
   if (ui['voice-error'].textContent !== voiceError) ui['voice-error'].textContent = voiceError;
+  renderListening(ready);
   const dirty = !same(applied, draft());
   ui.save.disabled = !state || !dirty || saving;
   const settingsText = settingsError || (!applied ? 'Waiting for the panel.' : dirty ? 'Apply changes before testing a reply.' : 'Applied for the next reply.');
   if (ui['settings-status'].textContent !== settingsText) ui['settings-status'].textContent = settingsText;
-  ui.preview.disabled = !state?.modelReady || dirty || generating || state.busy;
+  ui.preview.disabled = !state?.modelReady || dirty || generating || state.busy || state.capturing;
   ui.speak.disabled = ui.preview.disabled || !ready || state.playing || Boolean(voiceAction);
+}
+
+function renderListening(ready) {
+  const participants = state?.participants ?? [];
+  const listener = participants.find(({ id }) => id === state?.listenerId);
+  const key = JSON.stringify([ready, participants]);
+  if (key !== speakerKey) {
+    const selected = ui.speaker.value;
+    ui.speaker.replaceChildren(new Option(ready ? 'Choose a speaker' : 'Join a voice channel first', ''));
+    for (const { id, name } of participants) ui.speaker.add(new Option(name, id));
+    ui.speaker.value = participants.some(({ id }) => id === selected) ? selected :
+      (listener?.id ?? (participants.length === 1 ? participants[0].id : ''));
+    speakerKey = key;
+  }
+  const listening = Boolean(state?.listenerId);
+  ui.speaker.disabled = !ready || listening || listenPending || !participants.length;
+  ui.listen.textContent = listening ? 'Stop listening' : 'Start listening';
+  ui.listen.disabled = listenPending || (!listening && (!ready || !ui.speaker.value || !state.modelReady || Boolean(voiceAction)));
+
+  let text = 'Listening is off.';
+  if (listening) {
+    if (state.capturing) text = `Hearing ${listener?.name ?? 'the selected speaker'}…`;
+    else if (state.responding) text = 'Generating a reply locally…';
+    else if (state.playing) text = 'Discobuddy is speaking. Wait for it to finish.';
+    else if (!ready) text = 'Waiting for the voice connection…';
+    else text = `Listening for ${listener?.name ?? 'the selected speaker'}.`;
+  }
+  if (ui['listen-status'].textContent !== text) ui['listen-status'].textContent = text;
+  const error = listenRequestError || state?.listenError || '';
+  ui['listen-error'].hidden = !error;
+  if (ui['listen-error'].textContent !== error) ui['listen-error'].textContent = error;
 }
 
 async function refresh() {
@@ -139,6 +175,7 @@ async function changeVoice(name) {
   const operation = { name };
   voiceAction = operation;
   voiceRequestError = '';
+  listenRequestError = '';
   render();
   try { await api(name, name === 'join' ? { channelId: ui.channel.value } : {}); }
   catch (error) { if (voiceAction === operation) voiceRequestError = error.message; }
@@ -151,6 +188,18 @@ async function changeVoice(name) {
 }
 ui.join.addEventListener('click', () => void changeVoice('join'));
 ui.leave.addEventListener('click', () => void changeVoice('leave'));
+ui.speaker.addEventListener('change', () => { listenRequestError = ''; render(); });
+ui.listen.addEventListener('click', async () => {
+  listenPending = true;
+  listenRequestError = '';
+  render();
+  try { await api('listen', { userId: state.listenerId ? null : ui.speaker.value }); }
+  catch (error) { listenRequestError = error.message; }
+  finally {
+    listenPending = false;
+    await refresh();
+  }
+});
 
 ui.speech.addEventListener('submit', async (event) => {
   event.preventDefault();

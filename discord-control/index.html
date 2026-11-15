@@ -67,8 +67,18 @@
             <button id="join" class="primary" type="button" disabled>Join channel</button>
             <button id="leave" class="secondary" type="button" disabled>Leave channel</button>
           </div>
-          <p id="voice-note" class="small">The bot joins deafened. It only speaks when you send a prompt here.</p>
           <p id="voice-error" class="activity" data-error="true" role="alert" hidden></p>
+          <div class="model">
+            <h2>Talk to DiscoBuddy</h2>
+            <p>Choose yourself, start listening, then talk in Discord and pause for a reply. Let anyone in the channel know before you start. Only the selected speaker’s audio is processed, and it isn’t saved.</p>
+            <label for="speaker">Speaker</label>
+            <select id="speaker" disabled><option value="">Join a voice channel first</option></select>
+            <div class="actions">
+              <button id="listen" class="primary" type="button" disabled>Start listening</button>
+            </div>
+            <p id="listen-status" class="small activity" role="status">Listening is off.</p>
+            <p id="listen-error" class="small activity" data-error="true" role="alert" hidden></p>
+          </div>
         </section>
 
         <form id="speech" class="persona" aria-labelledby="speech-title">

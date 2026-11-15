@@ -2,7 +2,7 @@ import { pcm16, waveFile } from '../local-chat/audio.mjs';
 import { RealtimeSession } from '../local-chat/realtime.mjs';
 import { SpeechStretch } from '../local-chat/speech-stretch.mjs';
 
-export async function generateReply(modelPort, prompt, { persona, voice, speed }, signal) {
+export async function generateReply(modelPort, input, { persona, voice, speed }, signal) {
   signal.throwIfAborted();
   const session = new RealtimeSession(`ws://127.0.0.1:${modelPort}/v1/realtime`);
   const close = () => session.close();
@@ -10,7 +10,13 @@ export async function generateReply(modelPort, prompt, { persona, voice, speed }
   try {
     await session.open(persona, voice);
     signal.throwIfAborted();
-    const reply = await session.ask(prompt);
+    let reply;
+    if (typeof input === 'string') {
+      reply = await session.ask(input);
+    } else {
+      session.appendAudio(input.pcm, input.rate);
+      reply = await session.finishAudio();
+    }
     if (reply.speechError || !reply.audioSeconds || reply.status === 'failed') {
       throw new Error('The reply did not contain playable speech.');
     }

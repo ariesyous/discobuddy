@@ -93,3 +93,52 @@ test('converts mono model samples to continuous 48 kHz stereo PCM', () => {
   }
   assert.deepEqual(left, [0, 1000, 2000, 455, -1090, -1090]);
 });
+
+test('a spoken turn uses the current settings and stopping listening prevents late playback', async (t) => {
+  const { promise: cancelled, resolve: markCancelled } = Promise.withResolvers();
+  const { promise: played, resolve: markPlayed } = Promise.withResolvers();
+  const speaker = '123456789012345679';
+  const speech = { pcm: Buffer.alloc(16_000), rate: 16_000 };
+  const settings = { persona: 'Answer in one sentence.', voice: 'live', speed: 1.25 };
+  let submitSpeech;
+  let listenerId;
+  let playbackCount = 0;
+  const { post, get } = await serve(t, {
+    token: 'fixture-token',
+    makeBot: (_, _lost, { onUtterance, onListeningStopped }) => {
+      submitSpeech = onUtterance;
+      return {
+        start() {},
+        status: () => ({ gateway: 'online', voice: 'ready', listenerId, playing: false }),
+        setListener(id) {
+          listenerId = id;
+          if (!id) onListeningStopped();
+        },
+        play(reply, spoken) { playbackCount++; markPlayed({ reply, spoken }); },
+        close() {},
+      };
+    },
+    synthesize: async (_, input, applied, signal) => {
+      assert.deepEqual(applied, settings);
+      if (input === speech) return audio;
+      return new Promise((resolve) => signal.addEventListener('abort', () => {
+        resolve(audio);
+        markCancelled();
+      }, { once: true }));
+    },
+  });
+  assert.equal((await post('/api/settings', settings)).status, 200);
+  submitSpeech(speech);
+  assert.equal(playbackCount, 0);
+  assert.equal((await post('/api/listen', { userId: speaker })).status, 200);
+  submitSpeech(speech);
+  assert.deepEqual(await played, { reply: audio, spoken: true });
+  submitSpeech({ ...speech });
+  assert.equal((await get('/api/status').then((res) => res.json())).responding, true);
+  assert.equal((await post('/api/listen', { userId: null })).status, 200);
+  await cancelled;
+  const status = await get('/api/status').then((res) => res.json());
+  assert.equal(status.responding, false);
+  assert.equal(status.listenerId, null);
+  assert.equal(playbackCount, 1);
+});

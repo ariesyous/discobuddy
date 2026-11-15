@@ -59,7 +59,8 @@ To run the Discord bot:
    ```
 
    Set `DISCORD_BOT_TOKEN` in that file or in your environment. Never paste it into chat. The panel does not expose a token field or return the token from its API.
-4. When the panel shows **Bot online**, choose a channel and click **Join channel**. Type a prompt and click **Speak in Discord** to hear the generated reply in the channel. **Leave channel** stops playback and cancels an unfinished Discord reply. The bot joins deafened; it does not process channel audio.
+4. When the panel shows **Bot online**, choose a channel and click **Join channel**. To talk to the bot, join the same channel in Discord, let others know, select yourself under **Speaker**, and click **Start listening**. Speak, pause for about 0.8 seconds, then wait for the reply before speaking again. The bot processes only the selected speaker, keeps each turn in memory for local inference, and starts fresh for each reply.
+5. **Stop listening** discards an unfinished spoken turn and deafens the bot while it stays joined. **Leave channel** stops all Discord playback and cancels unfinished replies. The bot also stops listening if the selected speaker leaves. You can still type a prompt and select **Speak in Discord**.
 
 The panel binds to loopback, and there is no public endpoint or tunnel to configure. The bot uses the standard Guilds and Guild Voice States Gateway intents. [Discord voice](https://docs.discord.com/developers/topics/voice-connections) uses a separate voice WebSocket and UDP and requires DAVE end-to-end encryption for regular voice channels. The pinned `@discordjs/voice` release handles DAVE negotiation. If the bot connects to Discord but cannot join voice, verify that the network allows Discord's voice UDP traffic. The test server is needed to verify the real handshake and playback.
 
