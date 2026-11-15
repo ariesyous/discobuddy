@@ -33,12 +33,19 @@
         </select>
         <label for="persona">Persona instructions</label>
         <textarea id="persona" rows="7" maxlength="2400" placeholder="Try a tone, a role, and how long replies should be."></textarea>
+        <label for="voice">Voice</label>
+        <select id="voice">
+          <option value="live">Original live voice</option>
+          <option value="female">Female</option>
+          <option value="male">Male</option>
+        </select>
+        <p class="small">Female and male replies may take a little longer to start.</p>
         <button id="new-chat" class="secondary" type="button" disabled>Start new chat</button>
         <p class="small" id="persona-status" aria-live="polite"></p>
         <div class="model">
           <div class="overline">LOCAL MODEL</div>
           <strong>LFM3-Audio-2B</strong>
-          <p class="small">Your text and voice stay on this PC. The browser remembers only the last applied persona.</p>
+          <p class="small">Your text and voice stay on this PC. The browser remembers your last applied persona and voice.</p>
         </div>
       </aside>
 

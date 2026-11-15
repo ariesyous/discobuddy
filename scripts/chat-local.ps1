@@ -20,7 +20,7 @@ $site = Join-Path $root 'local-chat'
 $serverArgs = @(
     '--host', '127.0.0.1', '--port', "$Port", '--cors-origins', 'localhost',
     '--path', $site, '--model', $weights, '--mmproj', $projector,
-    '--ctx-size', '4096', '--parallel', '1', '--temp', '0'
+    '--ctx-size', '8192', '--parallel', '2', '--temp', '0'
 )
 if ($Cpu) {
     $serverArgs += @('--gpu-layers', '0', '--no-mmproj-offload')
