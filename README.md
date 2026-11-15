@@ -1,36 +1,30 @@
-# discobuddy
+# Discobuddy
 
-A local voice-chat Discord bot powered by `LFM3-Audio-2B`. The model needs only ~3–4GB of VRAM, so a single RTX 3070 can run inference locally while a Python bridge pipes audio to and from a Discord voice channel.
+Discobuddy Voice Lab is a local one-on-one chat for trying **LFM3-Audio-2B** before connecting it to Discord. Type or speak, get a spoken reply with text, and compare how different personas sound on your PC.
 
-## Architecture: the audio bridge
+## Run on Windows
 
-Discord's Voice Gateway sends encrypted **Opus audio over UDP** at **48kHz stereo**. `LFM3-Audio-2B` expects and outputs **24kHz mono PCM**. The bot sits in the middle as a real-time audio router:
+From the repository in PowerShell, run:
 
-1. **Discord ingest:** `discord.py` plus the `discord-ext-voice-recv` extension. Standard `discord.py` only sends audio; `voice-recv` hooks incoming RTP/UDP packets per user.
-2. **Resampling and VAD:** Decode Opus to PCM, downsample 48kHz stereo to 24kHz mono, and run a lightweight voice activity detector (`webrtcvad` or Silero VAD) so dead air and keyboard clicks never reach the model.
-3. **Local inference:** Stream 80ms audio chunks to the local Liquid AI server, using the system prompt `Respond with interleaved text and audio.`
-4. **Discord playback:** As `LFM3-Audio` streams back 24kHz audio tokens (decoded via `LiquidCodecStreamingCache`), upsample 24kHz mono to 48kHz stereo and feed a custom `discord.AudioSource` ring buffer.
+```powershell
+.\scripts\setup-local.ps1
+.\scripts\chat-local.ps1
+```
 
-## Discord-specific gotchas
+Setup downloads about 1.4 GB once: a portable [llama.cpp Vulkan build](https://github.com/ggml-org/llama.cpp/releases/tag/b12359) and [Liquid AI's GGUF model and audio projector](https://huggingface.co/LiquidAI/LFM3-Audio-2B-GGUF). It verifies the downloads and keeps them in the ignored `.local-runtime` folder. No Python, npm install, Discord token, or API key is needed. After setup, chat can run offline.
 
-1. **Multi-speaker chaos.** Full-duplex speech-to-speech models are trained on 1-on-1 conversations, so a raw mixed stream from several people talking over each other will confuse the model.
-   - `discord-ext-voice-recv` provides separate audio streams tagged by `user.id`.
-   - Gate input with a wake word (e.g. "Hey Bot..."), a push-to-talk slash/text toggle, or by locking onto whoever spoke first until their turn finishes.
-2. **Self-echo.** If the bot hears its own voice, or speaker bleed from someone's mic, it will interrupt itself.
-   - Filter out the bot's own SSRC/user ID on ingest.
-   - Use a barge-in threshold, e.g. require 250ms+ of sustained human speech before flushing the outbound playback buffer.
-3. **Personality via system prompt.** At 2B parameters the model is not for deep trivia, so lean into banter. Use a tight persona prompt (inside jokes, server role) and keep responses short so the bot doesn't monopolize the channel.
+Open [the Voice Lab](http://127.0.0.1:8765/) in Chrome or Edge. Wait for **Local model ready**, select **Start hands-free**, and allow microphone access. Speak and pause for about 0.8 seconds to send a turn. The microphone stays open during replies, so you can speak over Discobuddy to cut off its reply and start your next turn. **Stop hands-free** releases the microphone and discards any unfinished turn. Each turn can last up to 20 seconds.
 
-## Privacy and etiquette
+You can also type a message or use **Record** and **Stop & send** for a manual voice turn. Each reply shows when text and audio first arrived and when generation finished. Hands-free timings include the pause used to detect the end of speech. The first reply after startup can be slower. You can turn off automatic playback and replay individual replies.
 
-Discord's developer policy requires bots that receive voice audio to make it obvious they are listening. When the bot joins a channel it should post a message in the text channel (e.g. "Joined #general — listening for wake word") and leave automatically when everyone disconnects.
+To compare personas, try the same question with **Casual buddy** and **Deadpan teammate**. You can also write your own instructions. Select **Start new chat** after each change to apply the persona and clear the previous context. The browser keeps only the last applied persona across reloads; there is no saved chat or recording. Each open tab holds a model session, so use one Voice Lab tab at a time.
 
-## Planned stack
+Use `Ctrl+C` in the server terminal to stop it. If port 8765 is busy, launch with `-Port 8766` and open that port. If Vulkan is unavailable or GPU memory is tight, try `.\scripts\chat-local.ps1 -Cpu`; replies may take longer.
 
-- Python, `discord.py`, `discord-ext-voice-recv`
-- `liquid-audio` / `LFM3-Audio-2B` (local inference)
-- `webrtcvad` or Silero VAD
+## Development
 
-## Status
+llama.cpp serves the browser client on loopback and handles inference over `/v1/realtime`. The client reads the model's advertised PCM sample rates, resamples microphone input in the browser, and plays audio chunks as they arrive. In the current build LFM3 reports 16 kHz mono input and 24 kHz mono output.
 
-Planning. Next step: a starter skeleton with the UDP-to-24kHz resampling loop.
+Run the protocol and PCM checks with `node --test` (Node 22 or later). They don't need a model running.
+
+Discord is a separate next step. The voice bridge will need [Discord's DAVE protocol](https://docs.discord.com/developers/topics/voice-connections#end-to-end-encryption-dave-protocol), per-user turn control, and a clear listening notice. It can use the same local model with audio conversion between Discord and these sample rates.

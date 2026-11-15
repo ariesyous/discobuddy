@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' ws://127.0.0.1:*; media-src blob:; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Discobuddy · Voice Lab</title>
+  <link rel="stylesheet" href="./style.css">
+  <script type="module" src="./app.mjs"></script>
+</head>
+<body>
+  <main class="lab">
+    <header class="masthead">
+      <div class="brand">
+        <div class="mark" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+        <div><h1>Discobuddy</h1><p>Voice Lab</p></div>
+      </div>
+      <span id="connection" class="connection" data-state="connecting" role="status">Connecting</span>
+    </header>
+
+    <div class="workspace">
+      <aside class="persona" aria-labelledby="persona-title">
+        <div class="overline">SETUP</div>
+        <h2 id="persona-title">Persona</h2>
+        <p>Give Discobuddy a personality, then try the same question in a fresh chat.</p>
+        <label for="preset">Preset</label>
+        <select id="preset">
+          <option value="buddy">Casual buddy</option>
+          <option value="deadpan">Deadpan teammate</option>
+          <option value="coach">Patient coach</option>
+          <option value="blank">No persona</option>
+          <option value="custom">Custom</option>
+        </select>
+        <label for="persona">Persona instructions</label>
+        <textarea id="persona" rows="7" maxlength="2400" placeholder="Try a tone, a role, and how long replies should be."></textarea>
+        <button id="new-chat" class="secondary" type="button" disabled>Start new chat</button>
+        <p class="small" id="persona-status" aria-live="polite"></p>
+        <div class="model">
+          <div class="overline">LOCAL MODEL</div>
+          <strong>LFM3-Audio-2B</strong>
+          <p class="small">Your text and voice stay on this PC. The browser remembers only the last applied persona.</p>
+        </div>
+      </aside>
+
+      <section class="conversation" aria-labelledby="chat-title">
+        <header class="chat-header">
+          <h2 id="chat-title">Conversation</h2>
+          <label class="autoplay"><input id="autoplay" type="checkbox" checked> Play replies aloud</label>
+        </header>
+        <div id="transcript" class="transcript" aria-label="Chat messages" tabindex="0">
+          <div id="empty" class="empty">
+            <p class="overline">ONE ON ONE</p>
+            <h3>Try a conversation</h3>
+            <p>Start hands-free, pause to send a turn, and talk over a reply to interrupt.</p>
+            <div class="samples" aria-label="Suggested prompts">
+              <button type="button">What should we play tonight?</button>
+              <button type="button">Teach me something in two sentences.</button>
+            </div>
+          </div>
+          <div id="messages"></div>
+        </div>
+        <div class="composer">
+          <p id="activity" class="activity" role="status">Opening a session with the local model…</p>
+          <form id="message-form">
+            <label class="sr-only" for="message">Type a message</label>
+            <textarea id="message" rows="2" maxlength="3000" placeholder="Type a message…" required disabled></textarea>
+            <div class="actions">
+              <button id="hands-free" type="button" class="secondary" disabled>
+                <span class="record-icon" aria-hidden="true"></span><span id="hands-free-label">Start hands-free</span>
+              </button>
+              <button id="record" type="button" class="secondary" disabled>
+                <span class="record-icon" aria-hidden="true"></span><span id="record-label">Record</span>
+              </button>
+              <button id="cancel" type="button" class="secondary" hidden>Cancel reply</button>
+              <button id="send" type="submit" class="primary" disabled>Send</button>
+            </div>
+          </form>
+        </div>
+      </section>
+    </div>
+  </main>
+</body>
+</html>
