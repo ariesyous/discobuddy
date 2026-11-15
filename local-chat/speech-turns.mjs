@@ -5,6 +5,7 @@ const START_FRAMES = 5;
 const PRE_ROLL_FRAMES = 11;
 const END_PAUSE_FRAMES = 38;
 const TAIL_FRAMES = 6;
+const CHUNK_FRAMES = 4;
 
 function rms(frame) {
   let sum = 0;
@@ -18,8 +19,11 @@ function rms(frame) {
 
 export class SpeechTurns {
   #lead = [];
-  #utterance;
+  #chunk = [];
+  #heldSilence = [];
+  #turnFrames = 0;
   #onset = 0;
+  #onsetAge = 0;
   #quiet = 0;
   #noise = 0.002;
   #echo = new PlaybackEcho();
@@ -30,8 +34,11 @@ export class SpeechTurns {
 
   reset() {
     this.#lead = [];
-    this.#utterance = undefined;
+    this.#chunk = [];
+    this.#heldSilence = [];
+    this.#turnFrames = 0;
     this.#onset = 0;
+    this.#onsetAge = 0;
     this.#quiet = 0;
   }
 
@@ -39,7 +46,7 @@ export class SpeechTurns {
     const micLevel = rms(frame);
     const level = this.#echo.voiceLevel(frame, reference, micLevel);
     if (level < 0.005 && level < micLevel) frame = new Float32Array(frame.length);
-    if (!this.#utterance) {
+    if (!this.#turnFrames) {
       this.#lead.push(frame);
       if (this.#lead.length > PRE_ROLL_FRAMES) this.#lead.shift();
       if (level >= Math.max(0.008, this.#noise * 2.8)) {
@@ -48,21 +55,35 @@ export class SpeechTurns {
         this.#onset = Math.max(0, this.#onset - 1);
         this.#noise += 0.05 * (level - this.#noise);
       }
+      this.#onsetAge = this.#onset ? this.#onsetAge + 1 : 0;
       if (this.#onset < START_FRAMES) return;
-      this.#utterance = this.#lead;
+      const frames = this.#lead;
+      this.#turnFrames = frames.length;
       this.#lead = [];
-      return { type: 'speech' };
+      return { type: 'speech', frames, onsetDelayMs: this.#onsetAge * FRAME_MS };
     }
 
-    this.#utterance.push(frame);
-    this.#quiet = level < Math.max(0.005, this.#noise * 1.8) ? this.#quiet + 1 : 0;
-    if (this.#quiet < END_PAUSE_FRAMES && this.#utterance.length < this.maxFrames) return;
+    this.#turnFrames++;
+    if (level < Math.max(0.005, this.#noise * 1.8)) {
+      this.#quiet++;
+      // Keep longer pauses only if speech resumes. The turn retains 120 ms of trailing quiet.
+      if (this.#quiet > TAIL_FRAMES) this.#heldSilence.push(frame);
+      else this.#chunk.push(frame);
+    } else {
+      this.#quiet = 0;
+      this.#chunk.push(...this.#heldSilence, frame);
+      this.#heldSilence = [];
+    }
 
-    const frames = this.#utterance.length - Math.max(0, this.#quiet - TAIL_FRAMES);
-    const samples = new Float32Array(frames * frame.length);
-    for (let i = 0; i < frames; i++) samples.set(this.#utterance[i], i * frame.length);
-    const silenceMs = this.#quiet * FRAME_MS;
-    this.reset();
-    return { type: 'turn', samples, silenceMs };
+    if (this.#quiet >= END_PAUSE_FRAMES || this.#turnFrames >= this.maxFrames) {
+      const event = { type: 'turn', frames: this.#chunk, silenceMs: this.#quiet * FRAME_MS };
+      this.reset();
+      return event;
+    }
+    if (this.#chunk.length >= CHUNK_FRAMES) {
+      const frames = this.#chunk;
+      this.#chunk = [];
+      return { type: 'audio', frames };
+    }
   }
 }

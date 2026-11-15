@@ -42,7 +42,9 @@ export async function openHandsFree(context, { signal, maxSeconds, playbackOutpu
     });
     let listenId = 0;
     processor.port.onmessage = ({ data }) => {
-      if (!signal.aborted && data.id === listenId) onEvent(data);
+      if (signal.aborted || data.id !== listenId) return;
+      const at = performance.now() + (data.audioTime - context.currentTime) * 1000;
+      onEvent({ ...data, at });
     };
     processor.addEventListener('processorerror', () => onError(new Error('The microphone audio processor stopped.')));
     for (const track of tracks) track.addEventListener('ended', () => onError(new Error('The microphone disconnected.')));

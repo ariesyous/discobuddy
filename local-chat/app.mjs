@@ -1,4 +1,4 @@
-import { Playback, audioBufferToPcm, decodeRecording, recordMicrophone, waveFile } from './audio.mjs';
+import { Playback, decodeRecording, recordMicrophone, waveFile } from './audio.mjs';
 import { openHandsFree } from './hands-free.mjs';
 import { MAX_VOICE_SECONDS, RealtimeSession } from './realtime.mjs';
 
@@ -17,7 +17,7 @@ const ui = Object.fromEntries([
 const sampleButtons = ui.empty.querySelectorAll('button');
 const playback = new Playback(playbackChanged);
 const canRecord = Boolean(navigator.mediaDevices?.getUserMedia && globalThis.MediaRecorder && globalThis.AudioContext && globalThis.OfflineAudioContext);
-const canHandsFree = Boolean(navigator.mediaDevices?.getUserMedia && globalThis.AudioWorkletNode && globalThis.AudioContext && globalThis.OfflineAudioContext);
+const canHandsFree = Boolean(navigator.mediaDevices?.getUserMedia && globalThis.AudioWorkletNode && globalThis.AudioContext);
 const playbackUrls = new Set();
 const personaKey = 'discobuddy.persona';
 const socketUrl = new URL('/v1/realtime', location.href);
@@ -48,7 +48,7 @@ function render() {
   ui.connection.textContent = ready ? 'Local model ready' : phase === 'connecting' ? 'Connecting' : 'Disconnected';
   ui['new-chat'].disabled = !idle;
   ui.message.disabled = !ready || !idle;
-  ui.send.disabled = !ready || !idle || !ui.message.value.trim();
+  ui.send.disabled = !ready || !idle || handsFree?.speechStartedAt != null || !ui.message.value.trim();
   ui.record.disabled = !ready || !canRecord || Boolean(handsFree) || (!idle && phase !== 'recording');
   ui.record.dataset.recording = phase === 'recording';
   ui['record-label'].textContent = phase === 'recording' ? 'Stop & send' : 'Record';
@@ -76,7 +76,7 @@ function hush(except) {
 function playbackChanged() {
   if (playback.playing) return;
   audibleReply = undefined;
-  if (handsFree?.listening && !handsFree.speaking) {
+  if (handsFree?.listening && handsFree.speechStartedAt == null) {
     activity(activeReply ? 'Waiting for the local model…' : 'Listening. Speak, then pause to send.');
   }
 }
@@ -92,9 +92,11 @@ function syncHandsFree() {
 }
 
 function stopHandsFree() {
-  if (!handsFree) return;
-  handsFree.controller.abort();
+  if (!handsFree) return false;
+  const { controller } = handsFree;
   handsFree = undefined;
+  controller.abort();
+  return client?.discardAudio();
 }
 
 function clearMessages() {
@@ -109,12 +111,16 @@ function clearMessages() {
 
 async function newChat() {
   if (phase !== 'idle' || activeReply) return;
-  phase = 'connecting';
-  if (handsFree) handsFree.speaking = false;
+  if (handsFree) handsFree.speechStartedAt = undefined;
   client?.close();
   activePersona = ui.persona.value.trim();
   try { localStorage.setItem(personaKey, activePersona); } catch { /* The persona still works in memory. */ }
   clearMessages();
+  await connect();
+}
+
+async function connect({ message, error = false } = {}) {
+  phase = 'connecting';
   const next = new RealtimeSession(socketUrl, {
     onDisconnect(error) {
       if (client !== next) return;
@@ -129,8 +135,9 @@ async function newChat() {
   render();
   activity('Opening a session with the local model…');
   try {
-    await client.open(activePersona);
-    activity(canRecord || canHandsFree ? 'Ready for text or voice.' : 'Ready for text. This browser does not offer microphone recording here.');
+    await next.open(activePersona);
+    const readyMessage = canRecord || canHandsFree ? 'Ready for text or voice.' : 'Ready for text. This browser does not offer microphone recording here.';
+    activity(message ?? readyMessage, error);
   } catch (error) {
     stopHandsFree();
     activity(error.message, true);
@@ -159,7 +166,7 @@ function scrollToLatest() { ui.transcript.scrollTop = ui.transcript.scrollHeight
 function atLatest() { return ui.transcript.scrollHeight - ui.transcript.scrollTop - ui.transcript.clientHeight < 70; }
 function seconds(ms) { return `${(ms / 1000).toFixed(2)} s`; }
 
-function finishReply(message, reply) {
+function finishReply(message, reply, speech) {
   const { card, body } = message;
   let fallback = reply.audio.length ? 'Voice reply' : 'The model returned an empty reply.';
   if (message.stopReason) fallback = `Reply ${message.stopReason.toLowerCase()}.`;
@@ -181,6 +188,8 @@ function finishReply(message, reply) {
   const metrics = document.createElement('small');
   metrics.className = 'metrics';
   metrics.textContent = [
+    speech && `Speech ${seconds(speech.durationMs)}`,
+    speech && `End pause ${seconds(speech.silenceMs)}`,
     reply.firstTextMs != null && `First text ${seconds(reply.firstTextMs)}`,
     reply.firstAudioMs != null && `First audio ${seconds(reply.firstAudioMs)}`,
     `Total ${seconds(reply.totalMs)}`,
@@ -204,16 +213,17 @@ function cancelReply(reason) {
   }
 }
 
-async function sendTurn(input, startedAt = performance.now()) {
+async function sendTurn({ input, startedAt, speech }) {
   if (!client?.ready || activeReply) return;
   const typed = typeof input === 'string';
-  addMessage('user', typed ? input : `Voice message · ${seconds(input.length / (2 * client.inputRate) * 1000)}`);
+  const inputSeconds = speech ? client.pendingAudioSeconds : typed ? 0 : input.length / (2 * client.inputRate);
+  addMessage('user', typed ? input : `Voice message · ${seconds(inputSeconds * 1000)}`);
   const reply = addMessage('buddy', 'Thinking…');
   activeReply = reply;
   activity('Waiting for the local model…');
   render();
   try {
-    reply.pending = client.ask(input, {
+    const options = {
       startedAt,
       onText(text) {
         const follow = atLatest();
@@ -230,12 +240,13 @@ async function sendTurn(input, startedAt = performance.now()) {
           }
         }
       },
-    });
+    };
+    reply.pending = speech ? client.finishAudio(options) : client.ask(input, options);
     const result = await reply.pending;
     const follow = atLatest();
-    finishReply(reply, result);
+    finishReply(reply, result, speech);
     if (follow) scrollToLatest();
-    if (!handsFree?.speaking) {
+    if (handsFree?.speechStartedAt == null) {
       if (handsFree?.listening) {
         activity(playback.playing ? 'Discobuddy is speaking. Talk to interrupt.' : 'Listening. Speak, then pause to send.');
       } else {
@@ -258,28 +269,22 @@ function microphoneError(error) {
   return error.message;
 }
 
-async function submitHandsFreeTurn(mode, { samples, silenceMs }) {
-  const startedAt = performance.now() - silenceMs;
+async function submitHandsFreeTurn(mode, { at, silenceMs }) {
+  const endedAt = at - silenceMs;
   const session = client;
-  const previousReply = activeReply?.pending;
-  phase = 'encoding';
+  phase = 'submitting';
   render();
-  activity('Preparing your voice message…');
   try {
-    const input = playback.context.createBuffer(1, samples.length, playback.context.sampleRate);
-    input.copyToChannel(samples, 0);
-    const [pcm] = await Promise.all([audioBufferToPcm(input, session.inputRate, MAX_VOICE_SECONDS), previousReply]);
+    await activeReply?.pending;
     if (handsFree !== mode || client !== session || !session.ready) return;
-    mode.speaking = false;
+    const speech = { durationMs: endedAt - mode.speechStartedAt, silenceMs };
+    mode.speechStartedAt = undefined;
     phase = 'idle';
-    void sendTurn(pcm, startedAt);
-  } catch (error) {
-    if (handsFree === mode) {
-      stopHandsFree();
-      activity(microphoneError(error), true);
-    }
+    void sendTurn({ startedAt: endedAt, speech });
+  } catch {
+    // The session's disconnect handler reports a failed previous reply.
   } finally {
-    if (phase === 'encoding' && client === session) {
+    if (phase === 'submitting' && client === session) {
       phase = 'idle';
       render();
     }
@@ -288,9 +293,12 @@ async function submitHandsFreeTurn(mode, { samples, silenceMs }) {
 
 async function toggleHandsFree() {
   if (handsFree) {
-    stopHandsFree();
-    if (phase === 'idle' || phase === 'encoding') activity('Hands-free off.');
-    render();
+    if (stopHandsFree()) {
+      await connect({ message: 'Hands-free off. The unfinished turn was discarded and model context was reset.' });
+    } else {
+      if (phase === 'idle' || phase === 'submitting') activity('Hands-free off.');
+      render();
+    }
     return;
   }
   if (!client?.ready || phase !== 'idle' || activeReply || !canHandsFree) return;
@@ -302,9 +310,13 @@ async function toggleHandsFree() {
   activity('Waiting for microphone permission…');
   const fail = (error) => {
     if (handsFree !== mode) return;
-    stopHandsFree();
-    activity(microphoneError(error), true);
-    render();
+    const message = microphoneError(error);
+    if (stopHandsFree()) {
+      void connect({ message: `${message} The unfinished turn was discarded and model context was reset.`, error: true });
+    } else {
+      activity(message, true);
+      render();
+    }
   };
   try {
     await playback.unlock();
@@ -316,12 +328,18 @@ async function toggleHandsFree() {
       onEvent(event) {
         if (handsFree !== mode || !mode.listening || phase !== 'idle') return;
         if (event.type === 'speech') {
-          mode.speaking = true;
+          mode.speechStartedAt = event.at - event.onsetDelayMs;
           cancelReply('Interrupted');
           render();
           activity('Hearing you. Pause to send.');
         }
-        if (event.type === 'turn') void submitHandsFreeTurn(mode, event);
+        if (handsFree !== mode) return;
+        try {
+          if (event.pcm.length) client.appendAudio(event.pcm, playback.context.sampleRate);
+          if (event.type === 'turn') void submitHandsFreeTurn(mode, event);
+        } catch (error) {
+          fail(error);
+        }
       },
       onError: fail,
     });
@@ -363,7 +381,7 @@ async function beginRecording() {
     clearTimeout(recordingTimer);
     if (!client.ready) return;
     const pcm = await decodeRecording(blob, playback.context, client.inputRate, MAX_VOICE_SECONDS);
-    await sendTurn(pcm, sendTime);
+    await sendTurn({ input: pcm, startedAt: sendTime });
   } catch (error) {
     activity(microphoneError(error), true);
   } finally {
@@ -391,15 +409,12 @@ ui.message.addEventListener('keydown', (event) => {
 ui['message-form'].addEventListener('submit', (event) => {
   event.preventDefault();
   const input = ui.message.value.trim();
-  if (!input || phase !== 'idle' || activeReply || !client?.ready) return;
+  if (!input || phase !== 'idle' || activeReply || handsFree?.speechStartedAt != null || !client?.ready) return;
   ui.message.value = '';
   hush();
-  if (handsFree?.listening) {
-    handsFree.speaking = false;
-    handsFree.setListening(true);
-  }
+  if (handsFree?.listening) handsFree.setListening(true);
   if (ui.autoplay.checked) void playback.unlock().catch(() => {});
-  void sendTurn(input);
+  void sendTurn({ input });
 });
 ui.record.addEventListener('click', () => phase === 'recording' ? stopRecording() : void beginRecording());
 ui['hands-free'].addEventListener('click', toggleHandsFree);
