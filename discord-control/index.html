@@ -67,12 +67,11 @@
             <button id="join" class="primary" type="button" disabled>Join channel</button>
             <button id="leave" class="secondary" type="button" disabled>Leave channel</button>
           </div>
+          <p id="join-note" class="small">Joining starts listening to people in the channel. Let them know before you join.</p>
           <p id="voice-error" class="activity" data-error="true" role="alert" hidden></p>
           <div class="model">
             <h2>Talk to DiscoBuddy</h2>
-            <p>Choose yourself, start listening, then talk in Discord and pause for a reply. Let anyone in the channel know before you start. Only the selected speaker’s audio is processed, and it isn’t saved.</p>
-            <label for="speaker">Speaker</label>
-            <select id="speaker" disabled><option value="">Join a voice channel first</option></select>
+            <p>Speak in Discord, then pause for a reply. You can speak over DiscoBuddy to interrupt it. Audio is processed locally and isn’t saved.</p>
             <div class="actions">
               <button id="listen" class="primary" type="button" disabled>Start listening</button>
             </div>

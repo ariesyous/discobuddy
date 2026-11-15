@@ -1,7 +1,7 @@
 .status-group, .panels { display: flex; flex-wrap: wrap; gap: 8px; }
 .status-group { justify-content: flex-end; }
 .panels { display: grid; gap: 16px; min-width: 0; }
-#voice-error, #listen-status, #listen-error, #settings-status, #activity { margin-top: 10px; }
+#join-note, #voice-error, #listen-status, #listen-error, #settings-status, #activity { margin-top: 10px; }
 #save { margin-top: 16px; width: 100%; }
 #preview-audio { display: block; width: min(100%, 460px); margin-top: 8px; }
 @media (max-width: 400px) {

@@ -54,17 +54,17 @@ export async function createControlServer({
   let listenError = '';
   const cancelBroadcast = () => { if (job?.broadcast) job.controller.abort(); };
   const cancelSpoken = () => {
-    if (job?.spoken) job.controller.abort();
+    if (job?.speaker) job.controller.abort();
     listenError = '';
   };
 
-  async function runReply(input, { broadcast, spoken = false, controller }) {
-    job = { broadcast, spoken, controller };
+  async function runReply(input, { broadcast, speaker = null, controller }) {
+    job = { broadcast, speaker, controller };
     try {
       const reply = await synthesize(modelPort, input, settings, controller.signal);
       if (controller.signal.aborted) throw new RequestError(409, 'The reply was cancelled.');
       if (broadcast) {
-        try { bot.play(reply, spoken); }
+        try { bot.play(reply, speaker); }
         catch (error) { throw new RequestError(409, error.message); }
       }
       return reply;
@@ -76,10 +76,10 @@ export async function createControlServer({
   function onUtterance(input) {
     if (job) return;
     const status = bot.status();
-    if (status.voice !== 'ready' || status.playing || !status.listenerId) return;
+    if (status.voice !== 'ready' || status.playing || !status.listening) return;
     const controller = new AbortController();
     listenError = '';
-    void runReply(input, { broadcast: true, spoken: true, controller }).catch((error) => {
+    void runReply(input, { broadcast: true, speaker: input.speaker, controller }).catch((error) => {
       if (!controller.signal.aborted) listenError = error instanceof RequestError ? error.message : modelError;
     });
   }
@@ -105,7 +105,11 @@ export async function createControlServer({
       if (req.method === 'GET') {
         if (path === '/api/status') {
           const ready = await modelReady();
-          return json(res, 200, { ...voiceStatus(), modelReady: ready, busy: Boolean(job), responding: Boolean(job?.spoken), listenError, settings });
+          const status = voiceStatus();
+          return json(res, 200, {
+            ...status, modelReady: ready, busy: Boolean(job), responding: Boolean(job?.speaker),
+            speaker: status.speaker ?? job?.speaker ?? null, listenError, settings,
+          });
         }
         const asset = assets.get(path);
         if (asset) {
@@ -130,10 +134,8 @@ export async function createControlServer({
         }
         if (path === '/api/listen') {
           if (!bot) throw new RequestError(409, 'Set a bot token and restart the panel first.');
-          if (body.userId !== null && (typeof body.userId !== 'string' || !/^\d{17,20}$/.test(body.userId))) {
-            throw new RequestError(400, 'Choose a speaker from the joined voice channel.');
-          }
-          try { bot.setListener(body.userId); }
+          if (typeof body.enabled !== 'boolean') throw new RequestError(400, 'Choose whether to enable listening.');
+          try { bot.setListening(body.enabled); }
           catch (error) { throw new RequestError(409, error.message); }
           return json(res, 200, { ok: true });
         }

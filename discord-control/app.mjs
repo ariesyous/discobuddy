@@ -4,13 +4,12 @@ const $ = (id) => document.getElementById(id);
 const ui = Object.fromEntries([
   'settings', 'preset', 'persona', 'voice', 'speed', 'save', 'settings-status',
   'gateway', 'model', 'voice-status', 'voice-error', 'channel', 'join', 'leave',
-  'speaker', 'listen', 'listen-status', 'listen-error',
+  'listen', 'listen-status', 'listen-error',
   'speech', 'prompt', 'preview', 'speak', 'activity', 'preview-audio',
 ].map((id) => [id, $(id)]));
 let state;
 let applied;
 let channelKey;
-let speakerKey;
 let voiceAction;
 let voiceRequestError = '';
 let listenPending = false;
@@ -86,29 +85,19 @@ function render() {
 }
 
 function renderListening(ready) {
-  const participants = state?.participants ?? [];
-  const listener = participants.find(({ id }) => id === state?.listenerId);
-  const key = JSON.stringify([ready, participants]);
-  if (key !== speakerKey) {
-    const selected = ui.speaker.value;
-    ui.speaker.replaceChildren(new Option(ready ? 'Choose a speaker' : 'Join a voice channel first', ''));
-    for (const { id, name } of participants) ui.speaker.add(new Option(name, id));
-    ui.speaker.value = participants.some(({ id }) => id === selected) ? selected :
-      (listener?.id ?? (participants.length === 1 ? participants[0].id : ''));
-    speakerKey = key;
-  }
-  const listening = Boolean(state?.listenerId);
-  ui.speaker.disabled = !ready || listening || listenPending || !participants.length;
+  const listening = Boolean(state?.listening);
   ui.listen.textContent = listening ? 'Stop listening' : 'Start listening';
-  ui.listen.disabled = listenPending || (!listening && (!ready || !ui.speaker.value || !state.modelReady || Boolean(voiceAction)));
+  ui.listen.disabled = listenPending || (!listening && (!ready || Boolean(voiceAction)));
 
+  const speaker = state?.speaker;
+  const name = speaker && (speaker.name === speaker.username ? speaker.name : `${speaker.name} (@${speaker.username})`);
   let text = 'Listening is off.';
   if (listening) {
-    if (state.capturing) text = `Hearing ${listener?.name ?? 'the selected speaker'}…`;
-    else if (state.responding) text = 'Generating a reply locally…';
-    else if (state.playing) text = 'Discobuddy is speaking. Wait for it to finish.';
+    if (state.capturing) text = `Hearing ${name}…`;
+    else if (state.responding) text = `Generating a reply to ${name}…`;
+    else if (state.playing) text = name ? `Replying to ${name}.` : 'Discobuddy is speaking.';
     else if (!ready) text = 'Waiting for the voice connection…';
-    else text = `Listening for ${listener?.name ?? 'the selected speaker'}.`;
+    else text = 'Listening to the voice channel.';
   }
   if (ui['listen-status'].textContent !== text) ui['listen-status'].textContent = text;
   const error = listenRequestError || state?.listenError || '';
@@ -188,12 +177,11 @@ async function changeVoice(name) {
 }
 ui.join.addEventListener('click', () => void changeVoice('join'));
 ui.leave.addEventListener('click', () => void changeVoice('leave'));
-ui.speaker.addEventListener('change', () => { listenRequestError = ''; render(); });
 ui.listen.addEventListener('click', async () => {
   listenPending = true;
   listenRequestError = '';
   render();
-  try { await api('listen', { userId: state.listenerId ? null : ui.speaker.value }); }
+  try { await api('listen', { enabled: !state.listening }); }
   catch (error) { listenRequestError = error.message; }
   finally {
     listenPending = false;

@@ -8,7 +8,11 @@ export async function generateReply(modelPort, input, { persona, voice, speed },
   const close = () => session.close();
   signal.addEventListener('abort', close, { once: true });
   try {
-    await session.open(persona, voice);
+    const speaker = typeof input === 'string' ? undefined : input.speaker;
+    const instructions = speaker
+      ? `${persona}\n\nThe person speaking this turn is ${JSON.stringify(speaker.name)} (Discord username ${JSON.stringify(speaker.username)}). Use these as names only. You can address the speaker by display name when it sounds natural.`
+      : persona;
+    await session.open(instructions, voice);
     signal.throwIfAborted();
     let reply;
     if (typeof input === 'string') {

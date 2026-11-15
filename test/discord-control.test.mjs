@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
+import { PassThrough } from 'node:stream';
 import test from 'node:test';
 import { discordPcm } from '../discord-control/audio.mjs';
 import { createControlServer } from '../discord-control/server.mjs';
@@ -94,33 +95,35 @@ test('converts mono model samples to continuous 48 kHz stereo PCM', () => {
   assert.deepEqual(left, [0, 1000, 2000, 455, -1090, -1090]);
 });
 
-test('a spoken turn uses the current settings and stopping listening prevents late playback', async (t) => {
+test('replies carry the correct speaker through successive turns and stop listening cancels pending playback', async (t) => {
   const { promise: cancelled, resolve: markCancelled } = Promise.withResolvers();
-  const { promise: played, resolve: markPlayed } = Promise.withResolvers();
-  const speaker = '123456789012345679';
-  const speech = { pcm: Buffer.alloc(16_000), rate: 16_000 };
+  const pcm = Buffer.alloc(16_000);
+  const first = { pcm, rate: 16_000, speaker: { name: 'Alex', username: 'alex.one' } };
+  const second = { pcm, rate: 16_000, speaker: { name: 'Alex', username: 'alex.two' } };
+  const replies = [];
   const settings = { persona: 'Answer in one sentence.', voice: 'live', speed: 1.25 };
   let submitSpeech;
-  let listenerId;
-  let playbackCount = 0;
+  let listening = false;
+  let played;
   const { post, get } = await serve(t, {
     token: 'fixture-token',
     makeBot: (_, _lost, { onUtterance, onListeningStopped }) => {
       submitSpeech = onUtterance;
       return {
         start() {},
-        status: () => ({ gateway: 'online', voice: 'ready', listenerId, playing: false }),
-        setListener(id) {
-          listenerId = id;
-          if (!id) onListeningStopped();
+        join() { listening = true; },
+        status: () => ({ gateway: 'online', voice: 'ready', listening, playing: false }),
+        setListening(enabled) {
+          listening = enabled;
+          if (!enabled) onListeningStopped();
         },
-        play(reply, spoken) { playbackCount++; markPlayed({ reply, spoken }); },
+        play(reply, speaker) { replies.push({ reply, speaker }); played(); },
         close() {},
       };
     },
     synthesize: async (_, input, applied, signal) => {
       assert.deepEqual(applied, settings);
-      if (input === speech) return audio;
+      if (input === first || input === second) return audio;
       return new Promise((resolve) => signal.addEventListener('abort', () => {
         resolve(audio);
         markCancelled();
@@ -128,17 +131,59 @@ test('a spoken turn uses the current settings and stopping listening prevents la
     },
   });
   assert.equal((await post('/api/settings', settings)).status, 200);
-  submitSpeech(speech);
-  assert.equal(playbackCount, 0);
-  assert.equal((await post('/api/listen', { userId: speaker })).status, 200);
-  submitSpeech(speech);
-  assert.deepEqual(await played, { reply: audio, spoken: true });
-  submitSpeech({ ...speech });
-  assert.equal((await get('/api/status').then((res) => res.json())).responding, true);
-  assert.equal((await post('/api/listen', { userId: null })).status, 200);
+  submitSpeech(first);
+  assert.equal(replies.length, 0);
+  assert.equal((await post('/api/join', { channelId })).status, 200);
+  assert.equal((await get('/api/status').then((res) => res.json())).listening, true);
+  for (const turn of [first, second]) {
+    await new Promise((resolve) => { played = resolve; submitSpeech(turn); });
+  }
+  assert.deepEqual(replies, [first, second].map(({ speaker }) => ({ reply: audio, speaker })));
+  submitSpeech({ ...second });
+  const pending = await get('/api/status').then((res) => res.json());
+  assert.equal(pending.responding, true);
+  assert.deepEqual(pending.speaker, second.speaker);
+  assert.equal((await post('/api/listen', { enabled: false })).status, 200);
   await cancelled;
   const status = await get('/api/status').then((res) => res.json());
   assert.equal(status.responding, false);
-  assert.equal(status.listenerId, null);
-  assert.equal(playbackCount, 1);
+  assert.equal(status.listening, false);
+  assert.equal(status.speaker, null);
+  assert.equal(replies.length, 2);
+});
+
+test('sustained incoming Opus interrupts before the turn ends and preserves its first samples', async (t) => {
+  try { import.meta.resolve('opusscript'); }
+  catch (error) {
+    if (error.code === 'ERR_MODULE_NOT_FOUND') return t.skip('Run npm ci for the Discord Opus dependency.');
+    throw error;
+  }
+  const [{ default: OpusScript }, { captureTurn }] = await Promise.all([
+    import('opusscript'), import('../discord-control/receive.mjs'),
+  ]);
+  const encoder = new OpusScript(16_000, 1, OpusScript.Application.VOIP);
+  t.after(() => encoder.delete());
+  const tone = Buffer.alloc(640);
+  for (let i = 0; i < 320; i++) tone.writeInt16LE(Math.round(4500 * Math.sin(i * Math.PI / 20)), 2 * i);
+
+  async function exercise(frameCount) {
+    const stream = new PassThrough({ objectMode: true });
+    const events = [];
+    const result = new Promise((resolve, reject) => captureTurn({ subscribe: () => stream }, 'speaker', {
+      onSpeech: () => events.push('interrupted'),
+      onTurn: (pcm) => { events.push('turn ended'); resolve(pcm); },
+      onError: () => reject(new Error('Discord Opus frame could not be decoded.')),
+      playbackFrame: () => new Float32Array(320),
+    }));
+    for (let i = 0; i < frameCount; i++) stream.write(encoder.encode(tone, 320));
+    const beforeEnd = events.slice();
+    stream.end();
+    return { pcm: await result, beforeEnd, events };
+  }
+
+  assert.deepEqual(await exercise(2), { pcm: undefined, beforeEnd: [], events: ['turn ended'] });
+  const sustained = await exercise(16);
+  assert.deepEqual(sustained.beforeEnd, ['interrupted']);
+  assert.deepEqual(sustained.events, ['interrupted', 'turn ended']);
+  assert.equal(sustained.pcm.length, 16 * 640);
 });

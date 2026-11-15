@@ -7,6 +7,18 @@ import {
 import { discordPcm } from './audio.mjs';
 import { captureTurn, discordInputRate } from './receive.mjs';
 
+function referenceFrame(resource, delayMs) {
+  const raw = resource?.metadata.raw;
+  if (!raw) return;
+  const end = Math.min(raw.length / 4, (resource.playbackDuration - delayMs) * 48);
+  const start = end - 960;
+  if (start < 0) return;
+  return Float32Array.from({ length: 320 }, (_, i) => {
+    const offset = (start + 3 * i) * 4;
+    return (raw.readInt16LE(offset) + raw.readInt16LE(offset + 4) + raw.readInt16LE(offset + 8)) / (3 * 32768);
+  });
+}
+
 export function createDiscordBot(token, onVoiceLost, { onUtterance, onListeningStopped, isBusy }) {
   const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
   const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Stop } });
@@ -14,18 +26,18 @@ export function createDiscordBot(token, onVoiceLost, { onUtterance, onListeningS
   let active;
   let voiceError = '';
 
-  function clearListener(target) {
-    if (!target?.listenerId) return;
-    target.listenerId = undefined;
-    target.cancelCapture?.();
+  function clearListening(target) {
+    if (!target?.listening) return;
+    target.listening = false;
+    target.capture?.cancel();
     onListeningStopped();
-    if (player.state.resource?.metadata === 'spoken') player.stop(true);
+    if (player.state.resource?.metadata.speaker) player.stop(true);
   }
 
   function leave() {
     const target = active;
     active = undefined;
-    clearListener(target);
+    clearListening(target);
     onVoiceLost();
     player.stop(true);
     const connection = target?.connection;
@@ -48,12 +60,12 @@ export function createDiscordBot(token, onVoiceLost, { onUtterance, onListeningS
     if (after.id === client.user?.id) {
       if (before.channelId === active.id && after.channelId !== active.id) {
         lost('The bot was removed or moved from the selected voice channel.');
-      } else if (after.serverDeaf && active.listenerId) {
-        setListener(null);
+      } else if (after.serverDeaf && active.listening) {
+        setListening(false);
         voiceError = 'The bot was server deafened. Undeafen it before starting listening.';
       }
-    } else if (after.id === active.listenerId && after.channelId !== active.id) {
-      setListener(null);
+    } else if (after.id === active.capture?.userId && after.channelId !== active.id) {
+      active.capture.cancel();
     }
   });
 
@@ -63,30 +75,22 @@ export function createDiscordBot(token, onVoiceLost, { onUtterance, onListeningS
     ]);
   }
 
-  function participants() {
-    const channel = client.channels.cache.get(active?.id);
-    return channel ? channel.members.filter((member) => !member.user.bot)
-      .map((member) => ({ id: member.id, name: member.displayName }))
-      .sort((a, b) => a.name.localeCompare(b.name)) : [];
-  }
-
-  function setListener(userId) {
+  function setListening(enabled) {
     const target = active;
-    if (!userId) {
-      const wasListening = Boolean(target?.listenerId);
-      clearListener(target);
-      if (wasListening) target.connection.rejoin({ selfDeaf: true });
+    if (!enabled) {
+      if (target?.listening) {
+        clearListening(target);
+        target.connection.rejoin({ selfDeaf: true });
+      }
       return;
     }
     if (target?.connection.state.status !== VoiceConnectionStatus.Ready) throw new Error('Join a voice channel first.');
-    if (!participants().some(({ id }) => id === userId)) throw new Error('Choose someone in the joined voice channel.');
     if (client.guilds.cache.get(target.guildId)?.members.me?.voice.serverDeaf) {
       throw new Error('The bot is server deafened in this voice channel.');
     }
-    if (target.listenerId === userId) return;
-    clearListener(target);
+    if (target.listening) return;
     voiceError = '';
-    target.listenerId = userId;
+    target.listening = true;
     if (!target.connection.rejoin({ selfDeaf: false })) throw new Error('Discord did not accept the listening update.');
   }
 
@@ -100,7 +104,8 @@ export function createDiscordBot(token, onVoiceLost, { onUtterance, onListeningS
       bot: online ? client.user.username : '',
       channels, voice: active?.connection.state.status ?? 'idle',
       channelId: active?.id ?? null, playing: player.state.status !== AudioPlayerStatus.Idle, voiceError,
-      participants: participants(), listenerId: active?.listenerId ?? null, capturing: Boolean(active?.cancelCapture),
+      listening: Boolean(active?.listening), capturing: Boolean(active?.capture),
+      speaker: active?.capture?.speaker ?? player.state.resource?.metadata.speaker ?? null,
     };
   }
 
@@ -113,9 +118,9 @@ export function createDiscordBot(token, onVoiceLost, { onUtterance, onListeningS
     voiceError = '';
     const connection = joinVoiceChannel({
       channelId: id, guildId: channel.guild.id, adapterCreator: channel.guild.voiceAdapterCreator,
-      selfDeaf: true, selfMute: false, daveEncryption: true,
+      selfDeaf: false, selfMute: false, daveEncryption: true,
     });
-    const target = { id, guildId: channel.guild.id, connection };
+    const target = { id, guildId: channel.guild.id, connection, listening: true };
     active = target;
     connection.on('error', () => {
       if (active === target) lost('The Discord voice transport reported an error.');
@@ -125,7 +130,7 @@ export function createDiscordBot(token, onVoiceLost, { onUtterance, onListeningS
       if ([VoiceConnectionStatus.Disconnected, VoiceConnectionStatus.Destroyed].includes(next.status)) {
         lost('Discord voice disconnected. Select Join to retry.');
       } else if (previous.status === VoiceConnectionStatus.Ready && next.status !== VoiceConnectionStatus.Ready) {
-        target.cancelCapture?.();
+        target.capture?.cancel();
         onVoiceLost();
         player.stop(true);
       }
@@ -134,23 +139,42 @@ export function createDiscordBot(token, onVoiceLost, { onUtterance, onListeningS
       await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
       if (active !== target) throw new Error();
       connection.subscribe(player);
+      if (target.listening && channel.guild.members.me?.voice.serverDeaf) {
+        setListening(false);
+        voiceError = 'The bot is server deafened. Undeafen it before starting listening.';
+      }
       connection.receiver.speaking.on('start', (userId) => {
-        if (active !== target || target.listenerId !== userId || target.cancelCapture ||
-            connection.state.status !== VoiceConnectionStatus.Ready || isBusy() ||
-            player.state.status !== AudioPlayerStatus.Idle) return;
+        if (active !== target || !target.listening || target.capture ||
+            connection.state.status !== VoiceConnectionStatus.Ready || isBusy()) return;
+        const voiceState = channel.guild.voiceStates.cache.get(userId);
+        const member = voiceState?.member;
+        if (voiceState?.channelId !== id || !member || member.user.bot) return;
+
+        const speaker = { name: member.displayName, username: member.user.username };
+        const capture = { userId, speaker };
+        const playing = player.state.resource;
+        target.capture = capture;
         voiceError = '';
         const decodeError = () => { voiceError = 'Discord audio could not be decoded. Try speaking again.'; };
         try {
-          target.cancelCapture = captureTurn(connection.receiver, userId, {
+          capture.cancel = captureTurn(connection.receiver, userId, {
+            playbackFrame(delay) {
+              if (playing && player.state.resource === playing) return referenceFrame(playing, delay);
+            },
+            onSpeech() {
+              if (playing && player.state.resource === playing) player.stop(true);
+            },
             onTurn(pcm) {
-              target.cancelCapture = undefined;
-              if (pcm && active === target && target.listenerId === userId) {
-                onUtterance({ pcm, rate: discordInputRate });
-              }
+              if (target.capture !== capture) return;
+              target.capture = undefined;
+              if (pcm && active === target && target.listening) onUtterance({ pcm, rate: discordInputRate, speaker });
             },
             onError: decodeError,
           });
-        } catch { decodeError(); }
+        } catch {
+          target.capture = undefined;
+          decodeError();
+        }
       });
     } catch {
       if (active === target) lost('Could not join voice. Check channel permissions, capacity, and UDP access.');
@@ -165,9 +189,9 @@ export function createDiscordBot(token, onVoiceLost, { onUtterance, onListeningS
     },
     status,
     join,
-    setListener,
+    setListening,
     leave() { leave(); voiceError = ''; },
-    play(reply, spoken = false) {
+    play(reply, speaker = null) {
       if (active?.connection.state.status !== VoiceConnectionStatus.Ready) throw new Error('Join a voice channel first.');
       if (client.guilds.cache.get(active.guildId)?.members.me?.voice.serverMute) {
         throw new Error('The bot is server muted in this voice channel.');
@@ -175,7 +199,7 @@ export function createDiscordBot(token, onVoiceLost, { onUtterance, onListeningS
       voiceError = '';
       const raw = discordPcm(reply);
       player.play(createAudioResource(Readable.from([raw], { objectMode: false }), {
-        inputType: StreamType.Raw, metadata: spoken ? 'spoken' : 'typed',
+        inputType: StreamType.Raw, metadata: { speaker, raw },
       }));
     },
     close() { leave(); return client.destroy(); },
