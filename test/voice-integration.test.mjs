@@ -31,7 +31,8 @@ test('real local model answers spoken and typed turns with both selected voices'
     body: JSON.stringify({ input: 'Hello, what is two plus two?', voice: 'female', response_format: 'pcm' }),
   });
   assert.equal(spoken.ok, true, `Could not generate test speech: HTTP ${spoken.status}`);
-  const input = resample24to16(new Uint8Array(await spoken.arrayBuffer()));
+  const spokenPcm = new Uint8Array(await spoken.arrayBuffer());
+  const input = resample24to16(spokenPcm);
   assert.ok(input.length > 32000, 'The test question should contain at least one second of speech.');
 
   const socket = new URL('/v1/realtime', base);
@@ -50,18 +51,23 @@ test('real local model answers spoken and typed turns with both selected voices'
         assert.equal(delivered % 2, 0);
       }
       if (voice === 'male') {
+        const chunkBytes = 24000 * 2 * 0.08;
         let interrupted = false;
         const cancelled = await chat.ask('Tell me a short story about a spaceship.', {
           onAudio() {
             if (!interrupted) {
               interrupted = true;
               chat.cancel();
+              chat.appendAudio(spokenPcm.subarray(0, chunkBytes), 24000);
             }
           },
         });
         assert.equal(interrupted, true, 'The reply should start streaming audio.');
         assert.equal(cancelled.status, 'cancelled');
-        const next = await chat.ask(input);
+        for (let offset = chunkBytes; offset < spokenPcm.length; offset += chunkBytes) {
+          chat.appendAudio(spokenPcm.subarray(offset, offset + chunkBytes), 24000);
+        }
+        const next = await chat.finishAudio();
         assert.equal(next.status, 'completed');
         assert.equal(next.speechError, undefined);
         assert.match(next.text, /\b(?:4|four)\b/i);

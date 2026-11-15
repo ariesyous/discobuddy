@@ -1,3 +1,4 @@
+import { pcm16 } from './audio.mjs';
 import { FRAME_MS, SpeechTurns } from './speech-turns.mjs';
 
 class MicrophoneProcessor extends AudioWorkletProcessor {
@@ -33,13 +34,19 @@ class MicrophoneProcessor extends AudioWorkletProcessor {
       consumed += count;
       if (this.offset < this.frameSize) continue;
 
-      const event = this.turns.push(this.frame, this.referenceFrame);
-      if (event?.type === 'turn') {
-        this.listening = false;
-        this.port.postMessage({ ...event, id: this.listenId }, [event.samples.buffer]);
-        break;
+      const update = this.turns.push(this.frame, this.referenceFrame);
+      if (update) {
+        const { frames, ...event } = update;
+        const samples = new Float32Array(frames.length * this.frameSize);
+        for (let i = 0; i < frames.length; i++) samples.set(frames[i], i * this.frameSize);
+        const pcm = pcm16(samples);
+        const audioTime = (currentFrame + consumed) / sampleRate;
+        this.port.postMessage({ ...event, pcm, audioTime, id: this.listenId }, [pcm.buffer]);
+        if (event.type === 'turn') {
+          this.listening = false;
+          break;
+        }
       }
-      if (event) this.port.postMessage({ ...event, id: this.listenId });
       this.frame = new Float32Array(this.frameSize);
       this.offset = 0;
     }
