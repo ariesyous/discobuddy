@@ -1,4 +1,5 @@
 export const MAX_VOICE_SECONDS = 20;
+export const VOICES = ['live', 'female', 'male'];
 
 export class RealtimeSession {
   #socket;
@@ -8,10 +9,12 @@ export class RealtimeSession {
   #wireInputRate;
   #closed = false;
   #ready = false;
+  #voice = 'live';
 
-  constructor(url, { Socket = WebSocket, onDisconnect = () => {} } = {}) {
+  constructor(url, { Socket = WebSocket, fetch: request, onDisconnect = () => {} } = {}) {
     this.url = url;
     this.Socket = Socket;
+    this.request = request ?? globalThis.fetch.bind(globalThis);
     this.onDisconnect = onDisconnect;
   }
 
@@ -22,8 +25,27 @@ export class RealtimeSession {
     return audio ? audio.bytes / (2 * audio.rate) : 0;
   }
 
-  open(persona) {
+  async open(persona, voice = 'live') {
     if (this.#socket || this.#closed) throw new Error('Use a fresh session for a new chat.');
+    if (!VOICES.includes(voice)) throw new Error('Choose one of the available voices.');
+    this.#voice = voice;
+    if (voice !== 'live') {
+      let props;
+      try {
+        const response = await this.request(this.#httpUrl('/props'), { signal: AbortSignal.timeout(12_000) });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        props = await response.json();
+      } catch {
+        throw new Error('Could not check the local speech voices. Restart DiscoBuddy and try again.');
+      }
+      if (!Array.isArray(props.voices) || !props.voices.includes(voice)) {
+        throw new Error(`The local model does not support the ${voice} voice. Select another voice and start a new chat.`);
+      }
+      if (!Number.isInteger(props.total_slots) || props.total_slots < 2) {
+        throw new Error('Selected voices need two model slots. Stop the server and restart it with scripts/chat-local.ps1.');
+      }
+      if (this.#closed) throw new Error('Chat closed.');
+    }
     this.#socket = new this.Socket(this.url);
     this.#socket.addEventListener('message', ({ data }) => {
       if (this.#closed) return;
@@ -109,7 +131,10 @@ export class RealtimeSession {
   #respond(prepare, { onText, onAudio, startedAt = performance.now() } = {}) {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => this.#disconnect(new Error('The local model took too long. Start a new chat to try again.')), 120_000);
-      this.#turn = { resolve, reject, timer, onText, onAudio, startedAt, text: '', audio: [], bytes: 0 };
+      this.#turn = {
+        resolve, reject, timer, onText, onAudio, startedAt, text: '', audio: [], bytes: 0,
+        speechText: '', speechQueue: Promise.resolve(), speechAbort: new AbortController(), textDone: false,
+      };
       try {
         prepare();
         this.#send({ type: 'response.create' });
@@ -123,6 +148,8 @@ export class RealtimeSession {
     const turn = this.#turn;
     if (!turn || !this.#ready || turn.cancelRequested) return;
     turn.cancelRequested = true;
+    turn.speechAbort.abort();
+    if (turn.textDone) return;
     try { this.#send({ type: 'response.cancel' }); }
     catch (error) { this.#disconnect(error); }
   }
@@ -136,6 +163,97 @@ export class RealtimeSession {
     this.#socket.send(JSON.stringify(event));
   }
 
+  #httpUrl(path) {
+    const url = new URL(this.url);
+    url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:';
+    url.pathname = path;
+    url.search = '';
+    return url;
+  }
+
+  #queueSpeech(turn, text) {
+    const input = text.trim();
+    if (!input) return;
+    turn.speechQueue = turn.speechQueue.then(async () => {
+      if (turn.cancelRequested || turn.speechError || this.#turn !== turn) return;
+      await this.#speak(turn, input);
+    }).catch((error) => {
+      if (!turn.cancelRequested && this.#turn === turn) {
+        turn.speechError = error.message || 'Could not generate speech.';
+        turn.speechAbort.abort();
+      }
+    });
+  }
+
+  async #speak(turn, input) {
+    const response = await this.request(this.#httpUrl('/v1/audio/speech'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input, voice: this.#voice, response_format: 'pcm', stream_format: 'audio' }),
+      signal: turn.speechAbort.signal,
+    });
+    if (!response.ok) throw new Error(`Could not generate speech (HTTP ${response.status}).`);
+    const contentType = response.headers.get('content-type') || '';
+    const rate = Number(/(?:^|;)\s*rate\s*=\s*(\d+)/i.exec(contentType)?.[1]);
+    if (!/^audio\/pcm(?:;|$)/i.test(contentType) || rate !== this.outputRate ||
+        !/(?:^|;)\s*encoding\s*=\s*signed-int(?:;|$)/i.test(contentType) ||
+        !/(?:^|;)\s*bits\s*=\s*16(?:;|$)/i.test(contentType) || !response.body) {
+      throw new Error('The speech server returned an unsupported audio format.');
+    }
+    const reader = response.body.getReader();
+    let trailing;
+    let received = false;
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done || turn.cancelRequested || this.#turn !== turn) break;
+        if (!value?.length) continue;
+        let bytes = value;
+        if (trailing !== undefined) {
+          bytes = new Uint8Array(value.length + 1);
+          bytes[0] = trailing;
+          bytes.set(value, 1);
+          trailing = undefined;
+        }
+        if (bytes.length % 2) {
+          trailing = bytes[bytes.length - 1];
+          bytes = bytes.subarray(0, bytes.length - 1);
+        }
+        if (!bytes.length) continue;
+        turn.bytes += bytes.length;
+        if (turn.bytes > this.outputRate * 2 * 45) throw new Error('The model returned an oversized audio reply.');
+        received = true;
+        turn.firstAudioMs ??= performance.now() - turn.startedAt;
+        turn.audio.push(bytes);
+        turn.onAudio?.(bytes, this.outputRate);
+      }
+      if (!turn.cancelRequested && (trailing !== undefined || !received)) {
+        throw new Error('The speech server returned incomplete audio.');
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
+  #finish(turn, status) {
+    turn.speechQueue.then(() => {
+      if (this.#turn !== turn) return;
+      this.#turn = undefined;
+      clearTimeout(turn.timer);
+      turn.resolve({
+        text: turn.text, audio: turn.audio, outputRate: this.outputRate,
+        audioSeconds: turn.bytes / (2 * this.outputRate),
+        firstTextMs: turn.firstTextMs, firstAudioMs: turn.firstAudioMs,
+        totalMs: performance.now() - turn.startedAt,
+        status: turn.cancelRequested ? 'cancelled' : status,
+        speechError: turn.speechError,
+      });
+      // Resume a queued microphone turn after both generation and TTS have settled.
+      try { this.#flushAudio(); }
+      catch (error) { this.#disconnect(error); }
+    });
+  }
+
   #disconnect(error, notify = true) {
     if (this.#closed) return;
     const wasReady = this.#ready;
@@ -144,6 +262,7 @@ export class RealtimeSession {
     for (const pending of [this.#opening, this.#turn]) {
       if (pending) {
         clearTimeout(pending.timer);
+        pending.speechAbort?.abort();
         pending.reject(error);
       }
     }
@@ -186,15 +305,10 @@ export class RealtimeSession {
     if (!turn) return;
     const elapsed = performance.now() - turn.startedAt;
     if (event.type === 'response.done') {
-      this.#turn = undefined;
-      clearTimeout(turn.timer);
-      turn.resolve({
-        text: turn.text, audio: turn.audio, outputRate: this.outputRate,
-        audioSeconds: turn.bytes / (2 * this.outputRate),
-        firstTextMs: turn.firstTextMs, firstAudioMs: turn.firstAudioMs, totalMs: elapsed,
-        status: turn.cancelRequested ? 'cancelled' : event.response?.status,
-      });
-      this.#flushAudio();
+      turn.textDone = true;
+      if (this.#voice !== 'live' && !turn.cancelRequested) this.#queueSpeech(turn, turn.speechText);
+      turn.speechText = '';
+      this.#finish(turn, event.response?.status);
     } else if (turn.cancelRequested) {
       // Drain the cancelled response before admitting another turn on the same socket.
       return;
@@ -202,7 +316,16 @@ export class RealtimeSession {
       turn.firstTextMs ??= elapsed;
       turn.text += event.delta;
       turn.onText?.(turn.text);
-    } else if (event.type === 'response.output_audio.delta' && event.delta) {
+      if (this.#voice !== 'live') {
+        turn.speechText += event.delta;
+        let boundary;
+        while ((boundary = /[.!?]["'”’\)\]]*\s+|\n+/u.exec(turn.speechText))) {
+          const end = boundary.index + boundary[0].length;
+          this.#queueSpeech(turn, turn.speechText.slice(0, end));
+          turn.speechText = turn.speechText.slice(end);
+        }
+      }
+    } else if (this.#voice === 'live' && event.type === 'response.output_audio.delta' && event.delta) {
       const bytes = Uint8Array.from(atob(event.delta), (char) => char.charCodeAt(0));
       turn.bytes += bytes.length;
       if (bytes.length % 2 || turn.bytes > this.outputRate * 2 * 45) throw new Error('The model returned an invalid or oversized audio reply.');

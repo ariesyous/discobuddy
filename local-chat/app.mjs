@@ -1,6 +1,6 @@
 import { Playback, decodeRecording, recordMicrophone, waveFile } from './audio.mjs';
 import { openHandsFree } from './hands-free.mjs';
-import { MAX_VOICE_SECONDS, RealtimeSession } from './realtime.mjs';
+import { MAX_VOICE_SECONDS, RealtimeSession, VOICES } from './realtime.mjs';
 
 const presets = {
   buddy: 'You are Discobuddy, a laid-back friend in voice chat. Give warm, natural replies in one or two short sentences. Ask a follow-up only if it helps.',
@@ -10,7 +10,7 @@ const presets = {
 };
 const byId = (id) => document.getElementById(id);
 const ui = Object.fromEntries([
-  'preset', 'persona', 'new-chat', 'persona-status', 'message', 'message-form', 'send', 'record',
+  'preset', 'persona', 'voice', 'new-chat', 'persona-status', 'message', 'message-form', 'send', 'record',
   'record-label', 'hands-free', 'hands-free-label', 'cancel', 'connection', 'transcript', 'empty',
   'messages', 'activity', 'autoplay',
 ].map((id) => [id, byId(id)]));
@@ -20,6 +20,7 @@ const canRecord = Boolean(navigator.mediaDevices?.getUserMedia && globalThis.Med
 const canHandsFree = Boolean(navigator.mediaDevices?.getUserMedia && globalThis.AudioWorkletNode && globalThis.AudioContext);
 const playbackUrls = new Set();
 const personaKey = 'discobuddy.persona';
+const voiceKey = 'discobuddy.voice';
 const socketUrl = new URL('/v1/realtime', location.href);
 socketUrl.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
 
@@ -32,13 +33,18 @@ let handsFree;
 let activeReply;
 let audibleReply;
 let activePersona = presets.buddy;
+let activeVoice = 'live';
 try { activePersona = (localStorage.getItem(personaKey) ?? activePersona).slice(0, 2400); } catch { /* Storage may be disabled. */ }
+try { const saved = localStorage.getItem(voiceKey); if (VOICES.includes(saved)) activeVoice = saved; } catch { /* Storage may be disabled. */ }
 ui.persona.value = activePersona;
+ui.voice.value = activeVoice;
 
 function reflectPersona() {
   const draft = ui.persona.value.trim();
   ui.preset.value = Object.keys(presets).find((key) => presets[key] === draft) ?? 'custom';
-  ui['persona-status'].textContent = draft === activePersona ? 'Start a new chat to clear the conversation.' : 'Unsaved changes. Start a new chat to apply this persona.';
+  ui['persona-status'].textContent = draft === activePersona && ui.voice.value === activeVoice
+    ? 'Start a new chat to clear the conversation.'
+    : 'Unsaved changes. Start a new chat to apply your settings.';
 }
 
 function render() {
@@ -113,13 +119,13 @@ async function newChat() {
   if (phase !== 'idle' || activeReply) return;
   if (handsFree) handsFree.speechStartedAt = undefined;
   client?.close();
-  activePersona = ui.persona.value.trim();
-  try { localStorage.setItem(personaKey, activePersona); } catch { /* The persona still works in memory. */ }
+  const persona = ui.persona.value.trim();
+  const voice = ui.voice.value;
   clearMessages();
-  await connect();
+  await connect({ persona, voice });
 }
 
-async function connect({ message, error = false } = {}) {
+async function connect({ persona = activePersona, voice = activeVoice, message, error = false } = {}) {
   phase = 'connecting';
   const next = new RealtimeSession(socketUrl, {
     onDisconnect(error) {
@@ -135,7 +141,10 @@ async function connect({ message, error = false } = {}) {
   render();
   activity('Opening a session with the local model…');
   try {
-    await next.open(activePersona);
+    await next.open(persona, voice);
+    activePersona = persona;
+    activeVoice = voice;
+    try { localStorage.setItem(personaKey, activePersona); localStorage.setItem(voiceKey, activeVoice); } catch { /* Settings still work in memory. */ }
     const readyMessage = canRecord || canHandsFree ? 'Ready for text or voice.' : 'Ready for text. This browser does not offer microphone recording here.';
     activity(message ?? readyMessage, error);
   } catch (error) {
@@ -246,7 +255,9 @@ async function sendTurn({ input, startedAt, speech }) {
     const follow = atLatest();
     finishReply(reply, result, speech);
     if (follow) scrollToLatest();
-    if (handsFree?.speechStartedAt == null) {
+    if (result.speechError) {
+      activity(result.speechError, true);
+    } else if (handsFree?.speechStartedAt == null) {
       if (handsFree?.listening) {
         activity(playback.playing ? 'Discobuddy is speaking. Talk to interrupt.' : 'Listening. Speak, then pause to send.');
       } else {
@@ -398,6 +409,7 @@ ui.preset.addEventListener('change', () => {
   else reflectPersona();
 });
 ui.persona.addEventListener('input', reflectPersona);
+ui.voice.addEventListener('change', reflectPersona);
 ui['new-chat'].addEventListener('click', newChat);
 ui.message.addEventListener('input', render);
 ui.message.addEventListener('keydown', (event) => {
