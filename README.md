@@ -17,6 +17,8 @@ Open [the Voice Lab](http://127.0.0.1:8765/) in Chrome or Edge. Wait for **Local
 
 You can also type a message or use **Record** and **Stop & send** for a manual voice turn. Hands-free replies show detected speech duration and the end pause. First text, first audio, and total time are measured from the detected end of speech, so they include that pause. The first reply after startup can be slower. You can turn off automatic playback and replay individual replies.
 
+Use **Playback speed** above the conversation to play any voice from **0.75×** to **2×**, with pitch preserved. The setting applies to newly queued speech and updates replays immediately. The browser remembers your speed.
+
 If the model returns the same long reply across different turns, Voice Lab suppresses the third copy and retries that message once with fresh model context. It keeps your visible transcript, voice, and persona. Hands-free audio stays in memory until that turn finishes so the retry can use the same input.
 
 Choose **Original live voice**, **Female**, or **Male** under **Voice**, then select **Start new chat** to apply the change and clear the previous context. The original voice is the model's direct conversational speech. Female and male use the model's supported text-to-speech voices to read its reply, and may take longer to start; speech is streamed as sentences become available. Voice and persona are independent. The model does not offer voice cloning through this setup.

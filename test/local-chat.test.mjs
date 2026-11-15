@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { pcm16, waveFile } from '../local-chat/audio.mjs';
+import { pcm16, Playback, waveFile } from '../local-chat/audio.mjs';
 import { RealtimeSession } from '../local-chat/realtime.mjs';
+import { SpeechStretch } from '../local-chat/speech-stretch.mjs';
 import { SpeechTurns } from '../local-chat/speech-turns.mjs';
 
 class TestSocket extends EventTarget {
@@ -376,6 +377,80 @@ test('encodes little-endian mono PCM at the model rate for replay', async () => 
   assert.equal(wav.readUInt32LE(24), 24000);
   assert.equal(wav.readUInt32LE(40), 6);
   assert.deepEqual([44, 46, 48].map((offset) => wav.readInt16LE(offset)), [-32768, 0, 32767]);
+});
+
+test('changes duration without shifting pitch or depending on PCM chunk boundaries', () => {
+  const rate = 24000;
+  const input = Float32Array.from({ length: 21031 }, (_, i) => Math.sin(2 * Math.PI * 220 * i / rate));
+  const render = (speed, size) => {
+    const stretch = new SpeechStretch(rate, speed);
+    const chunks = [];
+    for (let i = 0; i < input.length; i += size) chunks.push(stretch.append(input.subarray(i, i + size)));
+    chunks.push(stretch.finish());
+    const length = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    const output = new Float32Array(length);
+    let offset = 0;
+    for (const chunk of chunks) {
+      output.set(chunk, offset);
+      offset += chunk.length;
+    }
+    assert.equal(stretch.finish().length, 0);
+    return output;
+  };
+  for (const speed of [0.75, 1.5, 2]) {
+    const streamed = render(speed, 293);
+    assert.equal(streamed.length, Math.round(input.length / speed));
+    assert.deepEqual(streamed, render(speed, input.length));
+    const trim = Math.round(streamed.length / 10);
+    let rises = 0;
+    for (let i = trim + 1; i < streamed.length - trim; i++) {
+      if (streamed[i - 1] <= 0 && streamed[i] > 0) rises++;
+    }
+    const pitch = rises * rate / (streamed.length - 2 * trim);
+    assert.ok(Math.abs(pitch - 220) < 5, `expected 220 Hz, got ${pitch} at ${speed}×`);
+  }
+});
+
+test('queues speed changes with continuous timing and drops the unfinished audio on stop', () => {
+  const playback = new Playback();
+  const rate = 24000;
+  const scheduled = [];
+  const stopped = [];
+  playback.output = {};
+  playback.context = {
+    state: 'running',
+    currentTime: 1,
+    createBuffer(channels, length, sampleRate) {
+      return { duration: length / sampleRate, copyToChannel() {} };
+    },
+    createBufferSource() {
+      return {
+        connect(output) { assert.equal(output, playback.output); },
+        start(at) { scheduled.push({ at, duration: this.buffer.duration }); },
+        stop() { stopped.push(this); },
+      };
+    },
+  };
+  const append = (samples) => playback.append(pcm16(new Float32Array(samples)), rate);
+  const duration = () => scheduled.reduce((sum, buffer) => sum + buffer.duration, 0);
+  playback.setSpeed(1.5);
+  append(7200);
+  assert.ok(duration() > 0 && duration() < 0.2, 'starts streaming before the tail is flushed');
+  playback.setSpeed(1.25);
+  assert.ok(Math.abs(duration() - 0.2) < 1e-9);
+  append(6000);
+  playback.finish();
+  assert.ok(Math.abs(duration() - 0.4) < 1e-9);
+  for (let i = 1; i < scheduled.length; i++) {
+    assert.equal(scheduled[i].at, scheduled[i - 1].at + scheduled[i - 1].duration);
+  }
+  append(80);
+  const before = scheduled.length;
+  playback.stop();
+  playback.finish();
+  assert.equal(stopped.length, before);
+  assert.equal(scheduled.length, before);
+  assert.equal(playback.playing, false);
 });
 
 test('ignores a click and keeps a brief pause inside one voice turn', () => {

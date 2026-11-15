@@ -60,9 +60,11 @@ button.primary:hover:not(:disabled) { background: #caf9e2; }
 .model strong { display: block; font-size: .9rem; margin: 5px 0; }
 
 .conversation { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; height: min(720px, max(500px, calc(100dvh - 136px))); min-width: 0; }
-.chat-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 15px 20px; border-bottom: 1px solid var(--line); }
-.autoplay { display: inline-flex; align-items: center; gap: 6px; font-size: .8rem; color: var(--muted); }
+.chat-header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; padding: 15px 20px; border-bottom: 1px solid var(--line); }
+.playback-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.autoplay, .playback-speed { display: inline-flex; align-items: center; gap: 6px; font-size: .8rem; color: var(--muted); }
 .autoplay input { accent-color: var(--accent); }
+.playback-speed select { width: auto; padding: 3px 7px; font-size: .8rem; }
 .transcript { overflow: auto; padding: 20px; overscroll-behavior: contain; }
 .transcript:focus-visible { outline-offset: -2px; }
 .empty { display: grid; align-content: center; gap: 8px; min-height: 100%; max-width: 415px; margin: auto; }

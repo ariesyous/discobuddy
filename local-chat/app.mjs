@@ -12,7 +12,7 @@ const byId = (id) => document.getElementById(id);
 const ui = Object.fromEntries([
   'preset', 'persona', 'voice', 'new-chat', 'persona-status', 'message', 'message-form', 'send', 'record',
   'record-label', 'hands-free', 'hands-free-label', 'cancel', 'connection', 'transcript', 'empty',
-  'messages', 'activity', 'autoplay',
+  'messages', 'activity', 'autoplay', 'playback-speed',
 ].map((id) => [id, byId(id)]));
 const sampleButtons = ui.empty.querySelectorAll('button');
 const playback = new Playback(playbackChanged);
@@ -21,6 +21,7 @@ const canHandsFree = Boolean(navigator.mediaDevices?.getUserMedia && globalThis.
 const playbackUrls = new Set();
 const personaKey = 'discobuddy.persona';
 const voiceKey = 'discobuddy.voice';
+const playbackSpeedKey = 'discobuddy.playback-speed';
 const MIN_REPEAT_CHARS = 48;
 const socketUrl = new URL('/v1/realtime', location.href);
 socketUrl.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -40,6 +41,11 @@ try { activePersona = (localStorage.getItem(personaKey) ?? activePersona).slice(
 try { const saved = localStorage.getItem(voiceKey); if (VOICES.includes(saved)) activeVoice = saved; } catch { /* Storage may be disabled. */ }
 ui.persona.value = activePersona;
 ui.voice.value = activeVoice;
+try {
+  const saved = localStorage.getItem(playbackSpeedKey);
+  if (Array.from(ui['playback-speed'].options).some(({ value }) => value === saved)) ui['playback-speed'].value = saved;
+} catch { /* Storage may be disabled. */ }
+playback.setSpeed(Number(ui['playback-speed'].value));
 
 function reflectPersona() {
   const draft = ui.persona.value.trim();
@@ -181,6 +187,11 @@ function scrollToLatest() { ui.transcript.scrollTop = ui.transcript.scrollHeight
 function atLatest() { return ui.transcript.scrollHeight - ui.transcript.scrollTop - ui.transcript.clientHeight < 70; }
 function seconds(ms) { return `${(ms / 1000).toFixed(2)} s`; }
 
+function setReplaySpeed(audio) {
+  audio.defaultPlaybackRate = playback.speed;
+  audio.playbackRate = playback.speed;
+}
+
 function finishReply(message, reply, speech) {
   const { card, body } = message;
   let fallback = reply.audio.length ? 'Voice reply' : 'The model returned an empty reply.';
@@ -190,8 +201,10 @@ function finishReply(message, reply, speech) {
     const audio = document.createElement('audio');
     audio.controls = true;
     audio.preload = 'none';
+    audio.preservesPitch = true;
     audio.setAttribute('aria-label', 'Replay Discobuddy’s reply');
     audio.src = URL.createObjectURL(waveFile(reply.audio, reply.outputRate));
+    setReplaySpeed(audio);
     playbackUrls.add(audio.src);
     audio.addEventListener('play', () => {
       if (handsFree?.setListening) playback.connectReplay(audio);
@@ -296,6 +309,8 @@ async function sendTurn({ input, startedAt = performance.now(), speech }) {
       const count = lastAnswer?.text === text && newPrompt ? lastAnswer.count + 1 : 1;
       lastAnswer = text.length >= MIN_REPEAT_CHARS ? { text, promptKey, count } : undefined;
     }
+    playback.finish();
+    if (playback.playing) audibleReply = reply;
     const follow = atLatest();
     finishReply(reply, result, speech);
     if (follow) scrollToLatest();
@@ -490,6 +505,11 @@ ui.cancel.addEventListener('click', () => {
 ui.autoplay.addEventListener('change', () => {
   if (!ui.autoplay.checked) hush();
   else void playback.unlock().catch(() => {});
+});
+ui['playback-speed'].addEventListener('change', () => {
+  playback.setSpeed(Number(ui['playback-speed'].value));
+  for (const audio of ui.messages.querySelectorAll('audio')) setReplaySpeed(audio);
+  try { localStorage.setItem(playbackSpeedKey, String(playback.speed)); } catch { /* Playback still works in memory. */ }
 });
 for (const button of sampleButtons) {
   button.addEventListener('click', () => {

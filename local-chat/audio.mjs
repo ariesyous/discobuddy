@@ -1,3 +1,5 @@
+import { SpeechStretch } from './speech-stretch.mjs';
+
 export function pcm16(samples) {
   const bytes = new Uint8Array(samples.length * 2);
   const view = new DataView(bytes.buffer);
@@ -74,12 +76,21 @@ export class Playback {
   #sources = new Set();
   #replays = new WeakMap();
   #next = 0;
+  #speed = 1;
+  #stretch;
 
   constructor(onChange = () => {}) {
     this.onChange = onChange;
   }
 
   get playing() { return this.#sources.size > 0; }
+  get speed() { return this.#speed; }
+
+  setSpeed(speed) {
+    if (!Number.isFinite(speed) || speed < 0.75 || speed > 2 || speed === this.#speed) return;
+    this.finish();
+    this.#speed = speed;
+  }
 
   async unlock() {
     if (!this.context) {
@@ -103,12 +114,34 @@ export class Playback {
   }
 
   append(bytes, rate) {
-    const context = this.context;
-    if (context?.state !== 'running' || !bytes.length) return;
-    const buffer = context.createBuffer(1, bytes.length / 2, rate);
-    const samples = buffer.getChannelData(0);
+    if (this.context?.state !== 'running' || !bytes.length) return;
+    const samples = new Float32Array(bytes.length / 2);
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     for (let i = 0; i < samples.length; i++) samples[i] = view.getInt16(i * 2, true) / 32768;
+
+    if (this.#speed === 1) {
+      this.#schedule(samples, rate);
+      return;
+    }
+    if (this.#stretch?.sampleRate !== rate) {
+      this.finish();
+      this.#stretch = new SpeechStretch(rate, this.#speed);
+    }
+    this.#schedule(this.#stretch.append(samples), rate);
+  }
+
+  finish() {
+    if (!this.#stretch) return;
+    const stretch = this.#stretch;
+    this.#stretch = undefined;
+    this.#schedule(stretch.finish(), stretch.sampleRate);
+  }
+
+  #schedule(samples, rate) {
+    if (!samples.length) return;
+    const context = this.context;
+    const buffer = context.createBuffer(1, samples.length, rate);
+    buffer.copyToChannel(samples, 0);
     const source = context.createBufferSource();
     source.buffer = buffer;
     source.connect(this.output);
@@ -127,6 +160,7 @@ export class Playback {
     const wasPlaying = this.playing;
     for (const source of this.#sources) source.stop();
     this.#sources.clear();
+    this.#stretch = undefined;
     this.#next = 0;
     if (wasPlaying) this.onChange();
   }
