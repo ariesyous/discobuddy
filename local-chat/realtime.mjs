@@ -14,12 +14,14 @@ export class RealtimeSession {
   #closed = false;
   #ready = false;
   #voice = 'live';
+  #released = false;
 
-  constructor(url, { Socket = WebSocket, fetch: request, onDisconnect = () => {} } = {}) {
+  constructor(url, { Socket = WebSocket, fetch: request, onDisconnect = () => {}, releaseBeforeSpeech = false } = {}) {
     this.url = url;
     this.Socket = Socket;
     this.request = request ?? globalThis.fetch.bind(globalThis);
     this.onDisconnect = onDisconnect;
+    this.releaseBeforeSpeech = releaseBeforeSpeech;
   }
 
   get ready() { return this.#ready; }
@@ -56,7 +58,9 @@ export class RealtimeSession {
       try { this.#receive(JSON.parse(data), persona); }
       catch (error) { this.#disconnect(error); }
     });
-    const lost = () => this.#disconnect(new Error('Could not reach the local model. Check the Discobuddy terminal, then start a new chat.'));
+    const lost = () => {
+      if (!this.#released) this.#disconnect(new Error('Could not reach the local model. Check the Discobuddy terminal, then start a new chat.'));
+    };
     this.#socket.addEventListener('error', lost);
     this.#socket.addEventListener('close', lost);
     return new Promise((resolve, reject) => {
@@ -151,10 +155,10 @@ export class RealtimeSession {
 
   cancel() {
     const turn = this.#turn;
-    if (!turn || !this.#ready || turn.cancelRequested) return;
+    if (!turn || turn.cancelRequested) return;
     turn.cancelRequested = true;
     turn.speechAbort.abort();
-    if (turn.textDone) return;
+    if (turn.textDone || !this.#ready) return;
     try { this.#send({ type: 'response.cancel' }); }
     catch (error) { this.#disconnect(error); }
   }
@@ -183,6 +187,11 @@ export class RealtimeSession {
     if (this.#voice === 'live') return;
 
     turn.speechText += delta;
+    if (this.releaseBeforeSpeech) return;
+    this.#queueSentences(turn);
+  }
+
+  #queueSentences(turn) {
     let boundary;
     while ((boundary = /[.!?]["'”’\)\]]*\s+|\n+/u.exec(turn.speechText))) {
       const end = boundary.index + boundary[0].length;
@@ -344,7 +353,16 @@ export class RealtimeSession {
         turn.repeated = replyKey(turn.text) === turn.checkingReply;
         if (!turn.repeated) this.#releaseReply(turn);
       }
-      if (this.#voice !== 'live' && !turn.cancelRequested && !turn.repeated) this.#queueSpeech(turn, turn.speechText);
+      if (this.#voice !== 'live' && !turn.cancelRequested && !turn.repeated) {
+        if (this.releaseBeforeSpeech) {
+          // Discord buffers the whole reply, so free its model slot before using TTS.
+          this.#released = true;
+          this.#ready = false;
+          this.#socket.close();
+          this.#queueSentences(turn);
+        }
+        this.#queueSpeech(turn, turn.speechText);
+      }
       turn.speechText = '';
       this.#finish(turn, event.response?.status);
     } else if (turn.cancelRequested) {

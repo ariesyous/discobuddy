@@ -44,7 +44,7 @@ npm ci
 npm run discord
 ```
 
-Open [Discord Voice Control](http://127.0.0.1:8767/). You can apply conversation guidelines, persona, voice, and playback speed and **Generate preview** before creating a bot. This panel uses the same model server as Voice Lab. If Voice Lab is using the model, finish its reply or close its browser tab to free up a session. Settings last until the panel process stops. Prompts and previews are not saved to disk.
+Open [Discord Voice Control](http://127.0.0.1:8767/). You can apply conversation guidelines, persona, voice, and playback speed and **Generate preview** before creating a bot. This panel uses the same model server as Voice Lab. For the female and male voices, Discord finishes generating the reply before requesting its speech, so one Voice Lab session can stay open. If both services are busy, wait for Voice Lab to finish its reply before generating another. Discord playback starts after the complete reply has been generated. Settings last until the panel process stops. Prompts and previews are not saved to disk.
 
 To run the Discord bot:
 
