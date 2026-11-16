@@ -32,6 +32,7 @@ export function createDiscordBot(token, onVoiceLost, {
   function clearListening(target) {
     if (!target?.listening) return;
     target.listening = false;
+    target.speakers.clear();
     target.capture?.cancel();
     onListeningStopped();
     if (player.state.resource?.metadata.speaker) player.stop(true);
@@ -69,6 +70,7 @@ export function createDiscordBot(token, onVoiceLost, {
         voiceError = 'The bot was server deafened. Undeafen it before starting listening.';
       }
     } else if (before.channelId === active.id && after.channelId !== active.id) {
+      active.speakers.delete(after.id);
       onHumanEnd(after.id);
       if (after.id === active.capture?.userId) active.capture.cancel();
     }
@@ -118,6 +120,7 @@ export function createDiscordBot(token, onVoiceLost, {
       channels, voice: active?.connection.state.status ?? 'idle',
       channelId: active?.id ?? null, playing: player.state.status !== AudioPlayerStatus.Idle, voiceError,
       listening: Boolean(active?.listening), capturing: Boolean(active?.capture), people,
+      speaking: Boolean(active?.speakers.size),
       speaker: active?.capture?.speaker ?? player.state.resource?.metadata.speaker ?? null,
     };
   }
@@ -133,7 +136,7 @@ export function createDiscordBot(token, onVoiceLost, {
       channelId: id, guildId: channel.guild.id, adapterCreator: channel.guild.voiceAdapterCreator,
       selfDeaf: !listening, selfMute: false, daveEncryption: true,
     });
-    const target = { id, guildId: channel.guild.id, connection, listening };
+    const target = { id, guildId: channel.guild.id, connection, listening, speakers: new Set() };
     active = target;
     connection.on('error', () => {
       if (active === target) lost('The Discord voice transport reported an error.');
@@ -143,6 +146,7 @@ export function createDiscordBot(token, onVoiceLost, {
       if ([VoiceConnectionStatus.Disconnected, VoiceConnectionStatus.Destroyed].includes(next.status)) {
         lost('Discord voice disconnected. Select Join to retry.');
       } else if (previous.status === VoiceConnectionStatus.Ready && next.status !== VoiceConnectionStatus.Ready) {
+        target.speakers.clear();
         target.capture?.cancel();
         onVoiceLost();
         player.stop(true);
@@ -162,14 +166,15 @@ export function createDiscordBot(token, onVoiceLost, {
         const voiceState = channel.guild.voiceStates.cache.get(userId);
         const member = voiceState?.member;
         if (voiceState?.channelId !== id || !member || member.user.bot) return;
+        target.speakers.add(userId);
         // Even while another turn is busy, human speech takes priority over a hangout line.
         onHumanStart(userId);
         if (target.capture || isBusy()) return;
 
         const playing = player.state.resource;
-        // Hangout lines always yield to sustained human speech, irrespective of
-        // the operator's interruption setting for conversational replies.
-        const mode = playing && (playing.metadata.hangout ? 'any' : interruptionMode());
+        // Unprompted replies always yield to sustained human speech, irrespective
+        // of the operator's interruption setting for directly requested replies.
+        const mode = playing && (playing.metadata.hangout || playing.metadata.proactive ? 'any' : interruptionMode());
         if (mode === 'finish') return;
         const overlap = playing ? {
           mode,
@@ -207,7 +212,7 @@ export function createDiscordBot(token, onVoiceLost, {
         }
       });
       connection.receiver.speaking.on('end', (userId) => {
-        if (active === target) onHumanEnd(userId);
+        if (active === target) { target.speakers.delete(userId); onHumanEnd(userId); }
       });
       onActivityChanged();
     } catch {
@@ -225,7 +230,7 @@ export function createDiscordBot(token, onVoiceLost, {
     join,
     setListening,
     leave() { leave(); voiceError = ''; },
-    play(reply, speaker = null, { hangout = false } = {}) {
+    play(reply, speaker = null, { hangout = false, proactive = false } = {}) {
       if (active?.connection.state.status !== VoiceConnectionStatus.Ready) throw new Error('Join a voice channel first.');
       if (client.guilds.cache.get(active.guildId)?.members.me?.voice.serverMute) {
         throw new Error('The bot is server muted in this voice channel.');
@@ -233,7 +238,7 @@ export function createDiscordBot(token, onVoiceLost, {
       voiceError = '';
       const raw = discordPcm(reply);
       player.play(createAudioResource(Readable.from([raw], { objectMode: false }), {
-        inputType: StreamType.Raw, metadata: { speaker, raw, hangout },
+        inputType: StreamType.Raw, metadata: { speaker, raw, hangout, proactive },
       }));
     },
     stopHangout() { if (player.state.resource?.metadata.hangout) player.stop(true); },
