@@ -1,11 +1,12 @@
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { presets } from '../local-chat/personas.mjs';
 import { VOICES } from '../local-chat/realtime.mjs';
-import { generateReply, previewWave, transcribeAudio } from './audio.mjs';
+import { countPromptTokens, generateReply, previewWave, transcribeAudio } from './audio.mjs';
+import { loadPrompt, savePrompt } from './prompt-settings.mjs';
 import {
-  addressedRequest, defaultConversation, interruptionModes, isStopRequest, MAX_GUIDELINES, replyModes, requiresAddress,
+  addressedRequest, defaultConversation, interruptionModes, isStopRequest, MAX_PROMPT_FIELD, PROMPT_TOKEN_BUDGET, replyModes, requiresAddress,
 } from './conversation.mjs';
 
 const host = '127.0.0.1';
@@ -31,7 +32,7 @@ async function readJson(req) {
   const chunks = [];
   for await (const chunk of req.iterator({ destroyOnReturn: false })) {
     size += chunk.length;
-    if (size > 16_384) {
+    if (size > 200_000) {
       req.resume();
       throw new RequestError(413, 'Request is too large.');
     }
@@ -48,10 +49,36 @@ function json(res, status, data) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' }).end(JSON.stringify(data));
 }
 
+function validPrompt({ persona, guidelines }) {
+  return typeof persona === 'string' && persona.length <= MAX_PROMPT_FIELD &&
+    typeof guidelines === 'string' && guidelines.length <= MAX_PROMPT_FIELD;
+}
+
+function validateSettings(body, current) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    throw new RequestError(400, 'Choose valid conversation settings.');
+  }
+  const {
+    persona, voice, speed, replyMode = current.replyMode,
+    interruptions = current.interruptions, guidelines = current.guidelines,
+  } = body;
+  if (!validPrompt({ persona, guidelines })) {
+    throw new RequestError(400, 'Limit persona and guidelines to 12,000 characters each.');
+  }
+  if (!VOICES.includes(voice) || !speeds.includes(speed) ||
+      !replyModes.includes(replyMode) || !interruptionModes.includes(interruptions)) {
+    throw new RequestError(400, 'Choose supported voice and conversation settings.');
+  }
+  return { persona: persona.trim(), voice, speed, replyMode, interruptions, guidelines: guidelines.trim() };
+}
+
 export async function createControlServer({
   modelPort = 8765, token = '', synthesize = generateReply, transcribe = transcribeAudio, makeBot,
+  countTokens = countPromptTokens,
+  settingsPath = fileURLToPath(new URL('../.local-runtime/discord-prompt.json', import.meta.url)),
 } = {}) {
-  let settings = { persona: presets.buddy, voice: 'live', speed: 1, ...defaultConversation };
+  let settings = { persona: presets.buddy, voice: 'live', speed: 1, ...defaultConversation, ...await loadPrompt(settingsPath) };
+  let settingsWrites = Promise.resolve();
   let job;
   let joining = false;
   let bot;
@@ -62,8 +89,8 @@ export async function createControlServer({
     listenError = '';
   };
 
-  async function runReply(input, { broadcast, speaker = null, controller, nameRequired = false, overlap }) {
-    const applied = settings;
+  async function runReply(input, { broadcast, speaker = null, controller, nameRequired = false, overlap, draftSettings }) {
+    const applied = draftSettings ?? settings;
     const { signal } = controller;
     job = { broadcast, speaker, controller, checkingSpeech: nameRequired || Boolean(overlap) };
     try {
@@ -148,19 +175,23 @@ export async function createControlServer({
         if (req.headers.origin !== `http://${authority}`) throw new RequestError(403, 'Use the local panel to change settings or voice.');
         const body = await readJson(req);
         if (path === '/api/settings') {
-          const {
-            persona, voice, speed, replyMode = settings.replyMode,
-            interruptions = settings.interruptions, guidelines = settings.guidelines,
-          } = body;
-          if (typeof persona !== 'string' || persona.length > 2400 || !VOICES.includes(voice) || !speeds.includes(speed)) {
-            throw new RequestError(400, 'Choose a supported voice and speed, and limit the persona to 2,400 characters.');
-          }
-          if (!replyModes.includes(replyMode) || !interruptionModes.includes(interruptions) ||
-              typeof guidelines !== 'string' || guidelines.length > MAX_GUIDELINES) {
-            throw new RequestError(400, 'Choose valid conversation settings and limit the guidelines to 1,600 characters.');
-          }
-          settings = { persona: persona.trim(), voice, speed, replyMode, interruptions, guidelines: guidelines.trim() };
+          const next = validateSettings(body, settings);
+          settingsWrites = settingsWrites.catch(() => {}).then(async () => {
+            await savePrompt(settingsPath, next);
+            settings = next;
+          });
+          await settingsWrites;
           return json(res, 200, settings);
+        }
+        if (path === '/api/prompt-tokens') {
+          if (!validPrompt(body)) throw new RequestError(400, 'Limit persona and guidelines to 12,000 characters each.');
+          try {
+            const count = await countTokens(modelPort, { persona: body.persona.trim(), guidelines: body.guidelines.trim() });
+            if (!Number.isInteger(count) || count < 0) throw new Error('Invalid token count.');
+            return json(res, 200, { count, budget: PROMPT_TOKEN_BUDGET });
+          } catch {
+            throw new RequestError(503, 'Could not count prompt tokens. Start the local model and try again.');
+          }
         }
         if (path === '/api/leave') {
           bot?.leave();
@@ -190,6 +221,8 @@ export async function createControlServer({
         }
         if (path === '/api/preview' || path === '/api/speak') {
           const broadcast = path === '/api/speak';
+          const draftSettings = !broadcast && body.settings !== undefined
+            ? validateSettings(body.settings, settings) : undefined;
           const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
           if (!prompt || prompt.length > 600) throw new RequestError(400, 'Enter a prompt of up to 600 characters.');
           const status = voiceStatus();
@@ -201,7 +234,7 @@ export async function createControlServer({
           const cancel = () => controller.abort();
           res.once('close', cancel);
           try {
-            const reply = await runReply(prompt, { broadcast, controller });
+            const reply = await runReply(prompt, { broadcast, controller, draftSettings });
             if (broadcast) return json(res, 200, { ok: true });
             const wav = Buffer.from(await previewWave(reply));
             return res.writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Length': wav.length }).end(wav);

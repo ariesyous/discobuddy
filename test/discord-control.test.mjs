@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
+import { rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
 import { discordPcm } from '../discord-control/audio.mjs';
@@ -10,7 +14,7 @@ const audio = { audio: [Buffer.from([0, 0, 0xD0, 7]), Buffer.from([0xBE, 0xFB])]
 const channelId = '123456789012345678';
 
 async function serve(t, options) {
-  const server = await createControlServer(options);
+  const server = await createControlServer({ settingsPath: null, ...options });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   t.after(() => new Promise((resolve, reject) => {
@@ -260,4 +264,42 @@ test('sustained incoming Opus interrupts before the turn ends and preserves its 
   assert.deepEqual(sustained.beforeEnd, ['interrupted']);
   assert.deepEqual(sustained.events, ['interrupted', 'turn ended']);
   assert.equal(sustained.pcm.length, 16 * 640);
+});
+
+test('prompt drafts can be counted and previewed without changing saved Discord settings', async (t) => {
+  const settingsPath = join(tmpdir(), `discobuddy-prompt-${randomUUID()}.json`);
+  t.after(() => rm(settingsPath, { force: true }));
+  const original = { persona: 'A'.repeat(3000), guidelines: 'B'.repeat(2000), voice: 'live', speed: 1 };
+  const draft = { ...original, persona: 'Draft persona', guidelines: 'Draft guidance', voice: 'female' };
+  const generated = [];
+  const counts = [];
+  const { get, post } = await serve(t, {
+    settingsPath,
+    token: 'fixture-token',
+    makeBot: () => ({
+      start() {}, status: () => ({ voice: 'ready', channelId, playing: false }), play() {}, close() {},
+    }),
+    countTokens: async (_, prompt) => { counts.push(prompt); return 1600; },
+    synthesize: async (_, prompt, settings) => { generated.push({ prompt, settings }); return audio; },
+  });
+  assert.equal((await post('/api/settings', original)).status, 200);
+  const count = await post('/api/prompt-tokens', { persona: ' Draft persona ', guidelines: ' Draft guidance ' });
+  assert.deepEqual(await count.json(), { count: 1600, budget: 1500 });
+  assert.deepEqual(counts, [{ persona: 'Draft persona', guidelines: 'Draft guidance' }]);
+  assert.equal((await post('/api/preview', { prompt: 'Hello', settings: draft })).status, 200);
+  assert.equal(generated[0].settings.persona, draft.persona);
+  assert.equal(generated[0].settings.guidelines, draft.guidelines);
+  assert.equal(generated[0].settings.voice, 'female');
+  assert.equal((await get('/api/status').then((res) => res.json())).settings.persona, original.persona);
+  assert.equal((await post('/api/speak', { prompt: 'Hello' })).status, 200);
+  assert.equal(generated[1].settings.persona, original.persona);
+  assert.equal(generated[1].settings.guidelines, original.guidelines);
+  assert.equal((await post('/api/preview', { prompt: 'Hello', settings: null })).status, 400);
+  assert.equal((await post('/api/prompt-tokens', { persona: 'x'.repeat(12_001), guidelines: '' })).status, 400);
+
+  const restarted = await serve(t, { settingsPath });
+  const restored = (await restarted.get('/api/status').then((res) => res.json())).settings;
+  assert.equal(restored.persona, original.persona);
+  assert.equal(restored.guidelines, original.guidelines);
+  assert.equal(restored.voice, 'live');
 });

@@ -1,6 +1,10 @@
 export const MAX_VOICE_SECONDS = 20;
 export const VOICES = ['live', 'female', 'male'];
 
+export function systemInstructions(persona) {
+  return `Respond with interleaved text and audio.\n\n${persona.trim()}`;
+}
+
 export function replyKey(text) {
   return text.trim().replace(/\s+/g, ' ').toLowerCase();
 }
@@ -320,7 +324,7 @@ export class RealtimeSession {
         type: 'session.update',
         session: {
           type: 'realtime',
-          instructions: `Respond with interleaved text and audio.\n\n${persona.trim()}`,
+          instructions: systemInstructions(persona),
           output_modalities: ['text', 'audio'],
           max_output_tokens: 384,
         },

@@ -44,7 +44,9 @@ npm ci
 npm run discord
 ```
 
-Open [Discord Voice Control](http://127.0.0.1:8767/). You can apply conversation guidelines, persona, voice, and playback speed and **Generate preview** before creating a bot. This panel uses the same model server as Voice Lab. If Voice Lab is using the model, finish its reply or close its browser tab to free up a session. Settings last until the panel process stops. Prompts and previews are not saved to disk.
+Open [Discord Voice Control](http://127.0.0.1:8767/). You can edit conversation guidelines, persona, voice, and playback speed and **Generate preview** before creating a bot. A preview uses the current draft; select **Apply settings** to use it for Discord replies. The panel saves the applied persona and guidelines locally in `.local-runtime/discord-prompt.json` and restores them on restart. Other conversation settings return to their defaults, and previews and recordings are not saved. This panel uses the same model server as Voice Lab. If Voice Lab is using the model, finish its reply or close its browser tab to free up a session.
+
+The prompt counter uses the local model's tokenizer on the assembled system instructions. Its suggested 1,500-token target leaves room in the 4,096-token session for spoken input and the reply. The count excludes the Discord speaker's name and the model's message formatting; longer audio also consumes context, so the target is a guide rather than a guarantee. A warning appears when the draft exceeds the target.
 
 To run the Discord bot:
 

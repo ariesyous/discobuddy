@@ -4,7 +4,7 @@ import { defaultConversation, requiresAddress } from '/conversation.mjs';
 const $ = (id) => document.getElementById(id);
 const ui = Object.fromEntries([
   'settings', 'preset', 'persona', 'voice', 'speed', 'save', 'settings-status',
-  'reply-mode', 'interruptions', 'guidelines', 'reset-guidelines', 'turn-hint',
+  'reply-mode', 'interruptions', 'guidelines', 'reset-guidelines', 'prompt-count', 'turn-hint',
   'gateway', 'model', 'voice-status', 'voice-error', 'channel', 'join', 'leave',
   'listen', 'listen-status', 'listen-error',
   'speech', 'prompt', 'preview', 'speak', 'activity', 'preview-audio',
@@ -20,6 +20,8 @@ let settingsError = '';
 let saving = false;
 let generating = false;
 let previewUrl;
+let tokenRequestNumber = 0;
+let tokenTimer;
 let requestNumber = 0;
 
 async function api(path, body) {
@@ -83,10 +85,10 @@ function render() {
   renderListening(ready);
   const dirty = !same(applied, draft());
   ui.save.disabled = !state || !dirty || saving;
-  const settingsText = settingsError || (!applied ? 'Waiting for the panel.' : dirty ? 'Apply changes before testing a reply.' : 'Applied for the next reply.');
+  const settingsText = settingsError || (!applied ? 'Waiting for the panel.' : dirty ? 'Preview this draft, or apply it for Discord replies.' : 'Applied for the next reply.');
   if (ui['settings-status'].textContent !== settingsText) ui['settings-status'].textContent = settingsText;
-  ui.preview.disabled = !state?.modelReady || dirty || generating || state.busy || state.capturing;
-  ui.speak.disabled = ui.preview.disabled || !ready || state.playing || Boolean(voiceAction);
+  ui.preview.disabled = !state?.modelReady || generating || state.busy || state.capturing;
+  ui.speak.disabled = ui.preview.disabled || dirty || !ready || state.playing || Boolean(voiceAction);
 }
 
 function renderListening(ready) {
@@ -126,7 +128,9 @@ async function refresh() {
   try {
     const updated = await (await api('status')).json();
     if (number !== requestNumber) return;
+    const modelChanged = Boolean(state?.modelReady) !== Boolean(updated.modelReady);
     state = updated;
+    let countChanged = modelChanged;
     if (!applied || (!saving && !same(applied, state.settings))) {
       const first = !applied;
       const follow = first || same(applied, draft());
@@ -139,11 +143,13 @@ async function refresh() {
         ui.interruptions.value = applied.interruptions;
         ui.guidelines.value = applied.guidelines;
         selectPreset();
+        countChanged = true;
       }
       if (first) ui.activity.textContent = 'Generate a preview to try the current settings.';
     }
+    if (countChanged) schedulePromptCount();
   } catch {
-    if (number === requestNumber) state = undefined;
+    if (number === requestNumber) { state = undefined; schedulePromptCount(); }
   } finally {
     if (number === requestNumber) render();
   }
@@ -153,7 +159,32 @@ function selectPreset() {
   ui.preset.value = Object.keys(presets).find((key) => presets[key] === ui.persona.value.trim()) ?? 'custom';
 }
 
-function settingsEdited() { settingsError = ''; render(); }
+function schedulePromptCount() {
+  const number = ++tokenRequestNumber;
+  clearTimeout(tokenTimer);
+  if (!state?.modelReady) {
+    ui['prompt-count'].textContent = 'Start the local model to count prompt tokens.';
+    ui['prompt-count'].dataset.error = 'false';
+    return;
+  }
+  ui['prompt-count'].textContent = 'Counting prompt tokens…';
+  tokenTimer = setTimeout(async () => {
+    try {
+      const { count, budget } = await (await api('prompt-tokens', {
+        persona: ui.persona.value.trim(), guidelines: ui.guidelines.value.trim(),
+      })).json();
+      if (number !== tokenRequestNumber) return;
+      ui['prompt-count'].dataset.error = String(count > budget);
+      ui['prompt-count'].textContent = count > budget
+        ? `${count.toLocaleString()} prompt tokens: above the ${budget.toLocaleString()}-token target. Shorten the draft to leave room for speech, the reply, and formatting.`
+        : `${count.toLocaleString()} / ${budget.toLocaleString()} suggested prompt tokens. The rest of the 4,096-token session is shared by speech, reply, speaker details, and formatting.`;
+    } catch {
+      if (number === tokenRequestNumber) ui['prompt-count'].textContent = 'Token count unavailable. Check the local model.';
+    }
+  }, 400);
+}
+
+function settingsEdited() { settingsError = ''; schedulePromptCount(); render(); }
 ui.preset.addEventListener('change', () => {
   if (Object.hasOwn(presets, ui.preset.value)) ui.persona.value = presets[ui.preset.value];
   else ui.persona.focus();
@@ -229,7 +260,8 @@ ui.speech.addEventListener('submit', async (event) => {
   ui.activity.textContent = 'Generating speech on this PC…';
   render();
   try {
-    const response = await api(action, { prompt: ui.prompt.value });
+    const response = await api(action, action === 'preview'
+      ? { prompt: ui.prompt.value, settings: draft() } : { prompt: ui.prompt.value });
     if (action === 'preview') {
       previewUrl = URL.createObjectURL(await response.blob());
       ui['preview-audio'].src = previewUrl;
