@@ -1,3 +1,5 @@
 /.local-runtime/
 /node_modules/
-/.env.discord
+/.env
+/.env.*
+!/.env.discord.example
