@@ -6,7 +6,8 @@ export const defaultConversation = Object.freeze({
 
 export const replyModes = ['group', 'addressed', 'open'];
 export const interruptionModes = ['addressed', 'any', 'finish'];
-export const MAX_GUIDELINES = 1600;
+export const MAX_PROMPT_FIELD = 12_000;
+export const PROMPT_TOKEN_BUDGET = 1500;
 
 export function requiresAddress(replyMode, people) {
   return replyMode === 'addressed' || (replyMode === 'group' && people !== 1);

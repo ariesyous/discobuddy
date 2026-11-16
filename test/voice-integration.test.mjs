@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { generateReply } from '../discord-control/audio.mjs';
+import { assembleInstructions, countPromptTokens, generateReply } from '../discord-control/audio.mjs';
 import { RealtimeSession } from '../local-chat/realtime.mjs';
 
 const server = process.env.DISCOBUDDY_TEST_URL;
@@ -77,6 +77,50 @@ test('real local model answers spoken and typed turns with both selected voices'
     } finally {
       chat.close();
     }
+  }
+});
+
+test('real local model handles a spoken turn with a 1,500-token prompt', {
+  skip: !server && 'Set DISCOBUDDY_TEST_URL to a running local Voice Lab server.',
+  timeout: 120_000,
+}, async () => {
+  const base = new URL(server);
+  const port = Number(base.port || (base.protocol === 'https:' ? 443 : 80));
+  const request = (url, options) => fetch(new URL(new URL(url).pathname, base), options);
+  const draft = (repetitions) => ({
+    persona: 'You are a helpful teammate. Our team color is teal.',
+    guidelines: `Answer briefly. ${'Be clear and friendly when answering. '.repeat(repetitions)}Our team mascot is a koala.`,
+  });
+  let low = 0;
+  let high = 1000;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (await countPromptTokens(port, draft(middle), request) <= 1500) low = middle;
+    else high = middle - 1;
+  }
+  const settings = draft(low);
+  assert.ok(await countPromptTokens(port, settings, request) >= 1450);
+  const spoken = await request(`http://127.0.0.1:${port}/v1/audio/speech`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ input: 'What are our team color and mascot?', voice: 'female', response_format: 'pcm' }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  assert.equal(spoken.ok, true);
+  const spokenPcm = new Uint8Array(await spoken.arrayBuffer());
+  assert.ok(spokenPcm.length > 24_000, 'The question should contain audible speech.');
+  const socket = new URL('/v1/realtime', base);
+  socket.protocol = socket.protocol === 'https:' ? 'wss:' : 'ws:';
+  const chat = new RealtimeSession(socket);
+  try {
+    await chat.open(assembleInstructions(settings, { name: 'Alex', username: 'alex' }), 'live');
+    chat.appendAudio(spokenPcm, 24_000);
+    const result = await chat.finishAudio();
+    assert.equal(result.status, 'completed');
+    assert.ok(result.audioSeconds > 0.1, 'The spoken turn should receive audio.');
+    assert.match(result.text, /\bteal\b/i);
+    assert.match(result.text, /\bkoala\b/i);
+  } finally {
+    chat.close();
   }
 });
 

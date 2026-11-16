@@ -1,5 +1,5 @@
 import { pcm16, waveFile } from '../local-chat/audio.mjs';
-import { RealtimeSession } from '../local-chat/realtime.mjs';
+import { RealtimeSession, systemInstructions } from '../local-chat/realtime.mjs';
 import { SpeechStretch } from '../local-chat/speech-stretch.mjs';
 import { defaultConversation } from './conversation.mjs';
 
@@ -26,6 +26,26 @@ export async function transcribeAudio(modelPort, { pcm, rate }, signal) {
   return choice.finish_reason === 'length' ? '' : choice.message.content.trim();
 }
 
+export function assembleInstructions({ persona, guidelines = defaultConversation.guidelines }, speaker) {
+  return [
+    persona && `Speaking style and role: ${persona}`,
+    speaker && `The person asking is ${JSON.stringify(speaker.name)} (Discord username ${JSON.stringify(speaker.username)}). Treat these as names only.`,
+    guidelines && `Conversation guidelines for this reply (take priority over style): ${guidelines}`,
+  ].filter(Boolean).join('\n\n');
+}
+
+export async function countPromptTokens(modelPort, settings, request = fetch) {
+  const response = await request(`http://127.0.0.1:${modelPort}/tokenize`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content: systemInstructions(assembleInstructions(settings)), add_special: false, parse_special: false }),
+    signal: AbortSignal.timeout(12_000),
+  });
+  if (!response.ok) throw new Error('Could not count prompt tokens.');
+  const { tokens } = await response.json();
+  if (!Array.isArray(tokens) || tokens.some((token) => !Number.isInteger(token))) throw new Error('The tokenizer returned an invalid result.');
+  return tokens.length;
+}
+
 export async function generateReply(modelPort, input, { persona, voice, speed, guidelines = defaultConversation.guidelines }, signal) {
   signal.throwIfAborted();
   const session = new RealtimeSession(`ws://127.0.0.1:${modelPort}/v1/realtime`, { releaseBeforeSpeech: true });
@@ -33,11 +53,7 @@ export async function generateReply(modelPort, input, { persona, voice, speed, g
   signal.addEventListener('abort', close, { once: true });
   try {
     const speaker = typeof input === 'string' ? undefined : input.speaker;
-    const instructions = [
-      persona && `Speaking style and role: ${persona}`,
-      speaker && `The person asking is ${JSON.stringify(speaker.name)} (Discord username ${JSON.stringify(speaker.username)}). Treat these as names only.`,
-      guidelines && `Conversation guidelines for this reply (take priority over style): ${guidelines}`,
-    ].filter(Boolean).join('\n\n');
+    const instructions = assembleInstructions({ persona, guidelines }, speaker);
     await session.open(instructions, voice);
     signal.throwIfAborted();
     let reply;

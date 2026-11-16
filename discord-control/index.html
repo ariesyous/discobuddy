@@ -40,7 +40,7 @@
         <details class="guideline-editor">
           <summary>Edit conversation guidelines</summary>
           <label for="guidelines">Instructions for replies</label>
-          <textarea id="guidelines" rows="6" maxlength="1600" placeholder="Set how replies should start, how long they should be, and when to ask a follow-up."></textarea>
+          <textarea id="guidelines" rows="6" maxlength="12000" placeholder="Set how replies should start, how long they should be, and when to ask a follow-up."></textarea>
           <button id="reset-guidelines" class="secondary" type="button">Restore default guidelines</button>
         </details>
 
@@ -55,7 +55,7 @@
             <option value="custom">Custom</option>
           </select>
           <label for="persona">Persona instructions</label>
-          <textarea id="persona" rows="4" maxlength="2400" placeholder="Give DiscoBuddy a tone or role."></textarea>
+          <textarea id="persona" rows="6" maxlength="12000" placeholder="Give DiscoBuddy a tone or role."></textarea>
           <label for="voice">Voice</label>
           <select id="voice">
             <option value="live">Original live voice</option>
@@ -73,6 +73,7 @@
             <option value="2">2×</option>
           </select>
         </div>
+        <p id="prompt-count" class="small activity" role="status">Waiting to count the prompt.</p>
         <button id="save" class="primary" disabled>Apply settings</button>
         <p class="small" id="settings-status" role="status">Waiting for the panel.</p>
       </form>
@@ -104,7 +105,7 @@
         <form id="speech" class="persona" aria-labelledby="speech-title">
           <div class="overline">LOCAL MODEL · LFM3-AUDIO-2B</div>
           <h2 id="speech-title">Test a voice reply</h2>
-          <p>Type a prompt and listen here first, or send the generated reply to your joined channel. Each prompt starts fresh.</p>
+          <p>Preview the current draft here, or send a reply with applied settings to your joined channel. Each prompt starts fresh.</p>
           <label for="prompt">Prompt</label>
           <textarea id="prompt" rows="3" maxlength="600" required placeholder="What’s the capital of Canada?"></textarea>
           <div class="actions">
