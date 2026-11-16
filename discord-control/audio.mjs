@@ -1,22 +1,49 @@
 import { pcm16, waveFile } from '../local-chat/audio.mjs';
 import { RealtimeSession } from '../local-chat/realtime.mjs';
 import { SpeechStretch } from '../local-chat/speech-stretch.mjs';
+import { defaultConversation } from './conversation.mjs';
 
-export async function generateReply(modelPort, input, { persona, voice, speed }, signal) {
+export async function transcribeAudio(modelPort, { pcm, rate }, signal) {
+  signal.throwIfAborted();
+  const wav = Buffer.from(await waveFile([pcm], rate).arrayBuffer());
+  const response = await fetch(`http://127.0.0.1:${modelPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      messages: [
+        { role: 'system', content: 'Perform ASR.' },
+        { role: 'user', content: [{ type: 'input_audio', input_audio: { format: 'wav', data: wav.toString('base64') } }] },
+      ],
+      max_tokens: 256,
+      temperature: 0,
+    }),
+    signal: AbortSignal.any([signal, AbortSignal.timeout(12_000)]),
+  });
+  if (!response.ok) throw new Error('The local model could not transcribe the turn.');
+  const { choices } = await response.json();
+  const choice = choices?.[0];
+  if (typeof choice?.message?.content !== 'string') throw new Error('The local model returned no transcription result.');
+  return choice.finish_reason === 'length' ? '' : choice.message.content.trim();
+}
+
+export async function generateReply(modelPort, input, { persona, voice, speed, guidelines = defaultConversation.guidelines }, signal) {
   signal.throwIfAborted();
   const session = new RealtimeSession(`ws://127.0.0.1:${modelPort}/v1/realtime`);
   const close = () => session.close();
   signal.addEventListener('abort', close, { once: true });
   try {
     const speaker = typeof input === 'string' ? undefined : input.speaker;
-    const instructions = speaker
-      ? `${persona}\n\nThe person speaking this turn is ${JSON.stringify(speaker.name)} (Discord username ${JSON.stringify(speaker.username)}). Use these as names only. You can address the speaker by display name when it sounds natural.`
-      : persona;
+    const instructions = [
+      persona && `Speaking style and role: ${persona}`,
+      speaker && `The person asking is ${JSON.stringify(speaker.name)} (Discord username ${JSON.stringify(speaker.username)}). Treat these as names only.`,
+      guidelines && `Conversation guidelines for this reply (take priority over style): ${guidelines}`,
+    ].filter(Boolean).join('\n\n');
     await session.open(instructions, voice);
     signal.throwIfAborted();
     let reply;
-    if (typeof input === 'string') {
-      reply = await session.ask(input);
+    const text = typeof input === 'string' ? input : input.text;
+    if (typeof text === 'string') {
+      reply = await session.ask(text);
     } else {
       session.appendAudio(input.pcm, input.rate);
       reply = await session.finishAudio();

@@ -1,8 +1,10 @@
 import { presets } from '/personas.mjs';
+import { defaultConversation, requiresAddress } from '/conversation.mjs';
 
 const $ = (id) => document.getElementById(id);
 const ui = Object.fromEntries([
   'settings', 'preset', 'persona', 'voice', 'speed', 'save', 'settings-status',
+  'reply-mode', 'interruptions', 'guidelines', 'reset-guidelines', 'turn-hint',
   'gateway', 'model', 'voice-status', 'voice-error', 'channel', 'join', 'leave',
   'listen', 'listen-status', 'listen-error',
   'speech', 'prompt', 'preview', 'speak', 'activity', 'preview-audio',
@@ -29,10 +31,13 @@ async function api(path, body) {
 }
 
 function draft() {
-  return { persona: ui.persona.value.trim(), voice: ui.voice.value, speed: Number(ui.speed.value) };
+  return {
+    persona: ui.persona.value.trim(), voice: ui.voice.value, speed: Number(ui.speed.value),
+    replyMode: ui['reply-mode'].value, interruptions: ui.interruptions.value, guidelines: ui.guidelines.value.trim(),
+  };
 }
 
-function same(a, b) { return a && b && a.persona === b.persona && a.voice === b.voice && a.speed === b.speed; }
+function same(a, b) { return a && b && Object.keys(a).every((key) => a[key] === b[key]); }
 
 function status(element, text, style) {
   if (element.textContent !== text) element.textContent = text;
@@ -91,13 +96,24 @@ function renderListening(ready) {
 
   const speaker = state?.speaker;
   const name = speaker && (speaker.name === speaker.username ? speaker.name : `${speaker.name} (@${speaker.username})`);
+  const conversation = state?.settings ?? defaultConversation;
+  const callNeeded = requiresAddress(conversation.replyMode, state?.people);
+  const turnHint = callNeeded ? 'Start the turn with “DiscoBuddy,” ask your question, then pause.' : 'Speak in Discord, then pause for a reply.';
+  const interruptionHint = {
+    addressed: 'Say “DiscoBuddy, stop” and pause to cut in.',
+    any: 'Speak over DiscoBuddy to cut in.',
+    finish: 'Wait for its reply to finish before speaking.',
+  };
+  const hint = `${turnHint} ${interruptionHint[conversation.interruptions]}`;
+  if (ui['turn-hint'].textContent !== hint) ui['turn-hint'].textContent = hint;
   let text = 'Listening is off.';
   if (listening) {
     if (state.capturing) text = `Hearing ${name}…`;
+    else if (state.checkingSpeech) text = 'Checking the spoken turn…';
     else if (state.responding) text = `Generating a reply to ${name}…`;
     else if (state.playing) text = name ? `Replying to ${name}.` : 'Discobuddy is speaking.';
     else if (!ready) text = 'Waiting for the voice connection…';
-    else text = 'Listening to the voice channel.';
+    else text = callNeeded ? 'Waiting to be called by name.' : 'Listening to the voice channel.';
   }
   if (ui['listen-status'].textContent !== text) ui['listen-status'].textContent = text;
   const error = listenRequestError || state?.listenError || '';
@@ -119,6 +135,9 @@ async function refresh() {
         ui.persona.value = applied.persona;
         ui.voice.value = applied.voice;
         ui.speed.value = applied.speed;
+        ui['reply-mode'].value = applied.replyMode;
+        ui.interruptions.value = applied.interruptions;
+        ui.guidelines.value = applied.guidelines;
         selectPreset();
       }
       if (first) ui.activity.textContent = 'Generate a preview to try the current settings.';
@@ -141,7 +160,12 @@ ui.preset.addEventListener('change', () => {
   settingsEdited();
 });
 ui.persona.addEventListener('input', () => { selectPreset(); settingsEdited(); });
-for (const el of [ui.voice, ui.speed]) el.addEventListener('change', settingsEdited);
+for (const el of [ui.voice, ui.speed, ui['reply-mode'], ui.interruptions]) el.addEventListener('change', settingsEdited);
+ui.guidelines.addEventListener('input', settingsEdited);
+ui['reset-guidelines'].addEventListener('click', () => {
+  ui.guidelines.value = defaultConversation.guidelines;
+  settingsEdited();
+});
 ui.channel.addEventListener('change', () => { voiceRequestError = ''; render(); });
 
 ui.settings.addEventListener('submit', async (event) => {

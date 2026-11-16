@@ -3,7 +3,10 @@ import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { presets } from '../local-chat/personas.mjs';
 import { VOICES } from '../local-chat/realtime.mjs';
-import { generateReply, previewWave } from './audio.mjs';
+import { generateReply, previewWave, transcribeAudio } from './audio.mjs';
+import {
+  addressedRequest, defaultConversation, interruptionModes, isStopRequest, MAX_GUIDELINES, replyModes, requiresAddress,
+} from './conversation.mjs';
 
 const host = '127.0.0.1';
 const speeds = [0.75, 1, 1.15, 1.25, 1.5, 1.75, 2];
@@ -11,6 +14,7 @@ const assets = new Map([
   ['/', ['./index.html', 'text/html']],
   ['/panel.css', ['./panel.css', 'text/css']],
   ['/app.mjs', ['./app.mjs', 'text/javascript']],
+  ['/conversation.mjs', ['./conversation.mjs', 'text/javascript']],
   ['/style.css', ['../local-chat/style.css', 'text/css']],
   ['/personas.mjs', ['../local-chat/personas.mjs', 'text/javascript']],
 ]);
@@ -45,9 +49,9 @@ function json(res, status, data) {
 }
 
 export async function createControlServer({
-  modelPort = 8765, token = '', synthesize = generateReply, makeBot,
+  modelPort = 8765, token = '', synthesize = generateReply, transcribe = transcribeAudio, makeBot,
 } = {}) {
-  let settings = { persona: presets.buddy, voice: 'live', speed: 1 };
+  let settings = { persona: presets.buddy, voice: 'live', speed: 1, ...defaultConversation };
   let job;
   let joining = false;
   let bot;
@@ -58,11 +62,29 @@ export async function createControlServer({
     listenError = '';
   };
 
-  async function runReply(input, { broadcast, speaker = null, controller }) {
-    job = { broadcast, speaker, controller };
+  async function runReply(input, { broadcast, speaker = null, controller, nameRequired = false, overlap }) {
+    const applied = settings;
+    const { signal } = controller;
+    job = { broadcast, speaker, controller, checkingSpeech: nameRequired || Boolean(overlap) };
     try {
-      const reply = await synthesize(modelPort, input, settings, controller.signal);
-      if (controller.signal.aborted) throw new RequestError(409, 'The reply was cancelled.');
+      if (job.checkingSpeech) {
+        let transcript;
+        try { transcript = await transcribe(modelPort, input, signal); }
+        catch {
+          if (signal.aborted) signal.throwIfAborted();
+          throw new RequestError(503, 'Could not check who was being addressed. Try again when the local model is available.');
+        }
+        signal.throwIfAborted();
+        const called = addressedRequest(transcript);
+        if (nameRequired && called === null) return;
+        if (overlap?.mode === 'addressed') overlap.stop();
+        const text = called ?? transcript.trim();
+        if (!text || isStopRequest(text)) return;
+        input = { text, speaker };
+        job.checkingSpeech = false;
+      }
+      const reply = await synthesize(modelPort, input, applied, signal);
+      if (signal.aborted) throw new RequestError(409, 'The reply was cancelled.');
       if (broadcast) {
         try { bot.play(reply, speaker); }
         catch (error) { throw new RequestError(409, error.message); }
@@ -73,20 +95,24 @@ export async function createControlServer({
     }
   }
 
-  function onUtterance(input) {
+  function onUtterance(input, overlap) {
     if (job) return;
     const status = bot.status();
-    if (status.voice !== 'ready' || status.playing || !status.listening) return;
+    if (status.voice !== 'ready' || (status.playing && !overlap) || !status.listening) return;
+    const nameRequired = requiresAddress(settings.replyMode, status.people) || overlap?.mode === 'addressed';
     const controller = new AbortController();
     listenError = '';
-    void runReply(input, { broadcast: true, speaker: input.speaker, controller }).catch((error) => {
+    void runReply(input, { broadcast: true, speaker: input.speaker, controller, nameRequired, overlap }).catch((error) => {
       if (!controller.signal.aborted) listenError = error instanceof RequestError ? error.message : modelError;
     });
   }
 
   if (token) {
     const factory = makeBot ?? (await import('./discord.mjs')).createDiscordBot;
-    bot = factory(token, cancelBroadcast, { onUtterance, onListeningStopped: cancelSpoken, isBusy: () => Boolean(job) });
+    bot = factory(token, cancelBroadcast, {
+      onUtterance, onListeningStopped: cancelSpoken, isBusy: () => Boolean(job),
+      interruptionMode: () => settings.interruptions,
+    });
   }
   const voiceStatus = () => bot?.status() ?? offline;
   const modelReady = () => fetch(`http://${host}:${modelPort}/health`, { signal: AbortSignal.timeout(1500) })
@@ -107,7 +133,8 @@ export async function createControlServer({
           const ready = await modelReady();
           const status = voiceStatus();
           return json(res, 200, {
-            ...status, modelReady: ready, busy: Boolean(job), responding: Boolean(job?.speaker),
+            ...status, modelReady: ready, busy: Boolean(job), checkingSpeech: Boolean(job?.checkingSpeech),
+            responding: Boolean(job?.speaker && !job.checkingSpeech),
             speaker: status.speaker ?? job?.speaker ?? null, listenError, settings,
           });
         }
@@ -121,11 +148,18 @@ export async function createControlServer({
         if (req.headers.origin !== `http://${authority}`) throw new RequestError(403, 'Use the local panel to change settings or voice.');
         const body = await readJson(req);
         if (path === '/api/settings') {
-          const { persona, voice, speed } = body;
+          const {
+            persona, voice, speed, replyMode = settings.replyMode,
+            interruptions = settings.interruptions, guidelines = settings.guidelines,
+          } = body;
           if (typeof persona !== 'string' || persona.length > 2400 || !VOICES.includes(voice) || !speeds.includes(speed)) {
             throw new RequestError(400, 'Choose a supported voice and speed, and limit the persona to 2,400 characters.');
           }
-          settings = { persona: persona.trim(), voice, speed };
+          if (!replyModes.includes(replyMode) || !interruptionModes.includes(interruptions) ||
+              typeof guidelines !== 'string' || guidelines.length > MAX_GUIDELINES) {
+            throw new RequestError(400, 'Choose valid conversation settings and limit the guidelines to 1,600 characters.');
+          }
+          settings = { persona: persona.trim(), voice, speed, replyMode, interruptions, guidelines: guidelines.trim() };
           return json(res, 200, settings);
         }
         if (path === '/api/leave') {
@@ -145,8 +179,11 @@ export async function createControlServer({
           if (typeof body.channelId !== 'string' || !/^\d{17,20}$/.test(body.channelId)) {
             throw new RequestError(400, 'Choose a voice channel.');
           }
+          if (body.listening !== undefined && typeof body.listening !== 'boolean') {
+            throw new RequestError(400, 'Choose whether to listen on join.');
+          }
           joining = true;
-          try { await bot.join(body.channelId); }
+          try { await bot.join(body.channelId, { listening: body.listening }); }
           catch (error) { throw new RequestError(409, error.message); }
           finally { joining = false; }
           return json(res, 200, { ok: true });

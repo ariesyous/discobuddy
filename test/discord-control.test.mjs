@@ -3,6 +3,7 @@ import { once } from 'node:events';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
 import { discordPcm } from '../discord-control/audio.mjs';
+import { addressedRequest, defaultConversation } from '../discord-control/conversation.mjs';
 import { createControlServer } from '../discord-control/server.mjs';
 
 const audio = { audio: [Buffer.from([0, 0, 0xD0, 7]), Buffer.from([0xBE, 0xFB])], rate: 24_000 };
@@ -30,7 +31,7 @@ test('previews speech without a bot and rejects changes from another origin', as
   const { get, post } = await serve(t, {
     synthesize: async (_, prompt, active) => {
       assert.equal(prompt, 'Say hello');
-      assert.deepEqual(active, settings);
+      assert.deepEqual(active, { ...settings, ...defaultConversation });
       return audio;
     },
   });
@@ -112,7 +113,7 @@ test('replies carry the correct speaker through successive turns and stop listen
       return {
         start() {},
         join() { listening = true; },
-        status: () => ({ gateway: 'online', voice: 'ready', listening, playing: false }),
+        status: () => ({ gateway: 'online', voice: 'ready', listening, playing: false, people: 1 }),
         setListening(enabled) {
           listening = enabled;
           if (!enabled) onListeningStopped();
@@ -122,7 +123,7 @@ test('replies carry the correct speaker through successive turns and stop listen
       };
     },
     synthesize: async (_, input, applied, signal) => {
-      assert.deepEqual(applied, settings);
+      assert.deepEqual(applied, { ...settings, ...defaultConversation });
       if (input === first || input === second) return audio;
       return new Promise((resolve) => signal.addEventListener('abort', () => {
         resolve(audio);
@@ -150,6 +151,79 @@ test('replies carry the correct speaker through successive turns and stop listen
   assert.equal(status.listening, false);
   assert.equal(status.speaker, null);
   assert.equal(replies.length, 2);
+});
+
+test('recognizes a call for DiscoBuddy without treating a mention as a request', () => {
+  assert.equal(addressedRequest('Hey, Disco Buddy, what is seven plus five?'), 'what is seven plus five?');
+  assert.equal(addressedRequest('Discobuddy can you help?'), 'can you help?');
+  assert.equal(addressedRequest('What do you think, DiscoBuddy?'), 'What do you think');
+  assert.equal(addressedRequest('DiscoBuddy?'), '');
+  assert.equal(addressedRequest("DiscoBuddy's microphone is on."), null);
+  assert.equal(addressedRequest('Disco Buddy is listening.'), null);
+  assert.equal(addressedRequest('Sam, ask DiscoBuddy about the game.'), null);
+  assert.equal(addressedRequest('Is DiscoBuddy listening?'), null);
+});
+
+test('group turns stay quiet unless called and side talk cannot stop a reply in addressed mode', async (t) => {
+  const conversations = [];
+  let people = 2;
+  let playing = false;
+  let stops = 0;
+  let submitSpeech;
+  let activeInterruptionMode;
+  const speaker = { name: 'Alex', username: 'alex.one' };
+  const settings = { persona: 'Casual.', voice: 'live', speed: 1, guidelines: 'Keep it to one line.' };
+  const { post, get } = await serve(t, {
+    token: 'fixture-token',
+    makeBot: (_, _lost, { onUtterance, interruptionMode }) => {
+      submitSpeech = onUtterance;
+      activeInterruptionMode = interruptionMode;
+      return {
+        start() {},
+        status: () => ({ voice: 'ready', listening: true, people, playing }),
+        play() {},
+        close() {},
+      };
+    },
+    transcribe: async (_, input) => input.fixtureTranscript,
+    synthesize: async (_, input, applied) => {
+      conversations.push({ input, guidelines: applied.guidelines });
+      return audio;
+    },
+  });
+  async function speak(fixtureTranscript, overlap) {
+    const input = { pcm: Buffer.alloc(2), rate: 16_000, speaker, fixtureTranscript };
+    submitSpeech(input, overlap);
+    await new Promise(setImmediate);
+    return input;
+  }
+  assert.equal((await post('/api/settings', { ...settings, interruptions: 'invalid' })).status, 400);
+  assert.equal((await post('/api/settings', settings)).status, 200);
+  assert.equal(activeInterruptionMode(), 'addressed');
+  await speak('Alex, do you see the game?');
+  assert.equal(conversations.length, 0);
+  await speak('Disco Buddy, what is seven plus five?');
+  assert.deepEqual(conversations, [{ input: { text: 'what is seven plus five?', speaker }, guidelines: settings.guidelines }]);
+  assert.equal((await get('/api/status').then((res) => res.text())).includes('seven plus five'), false);
+
+  playing = true;
+  const overlap = { mode: 'addressed', stop() { stops++; playing = false; } };
+  await speak('Alex, wait.', overlap);
+  assert.equal(stops, 0);
+  assert.equal(conversations.length, 1);
+  await speak('DiscoBuddy, stop.', overlap);
+  assert.equal(stops, 1);
+  assert.equal(conversations.length, 1);
+
+  people = 1;
+  const solo = await speak('What is the score?');
+  assert.equal(conversations.at(-1).input, solo);
+  assert.equal((await post('/api/settings', { ...settings, replyMode: 'open', interruptions: 'any' })).status, 200);
+  assert.equal(activeInterruptionMode(), 'any');
+  people = 3;
+  const open = await speak('What happened in the last round?');
+  assert.equal(conversations.at(-1).input, open);
+  assert.equal(conversations.length, 3);
 });
 
 test('sustained incoming Opus interrupts before the turn ends and preserves its first samples', async (t) => {
