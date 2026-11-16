@@ -14,7 +14,7 @@ const audio = { audio: [Buffer.from([0, 0, 0xD0, 7]), Buffer.from([0xBE, 0xFB])]
 const channelId = '123456789012345678';
 
 async function serve(t, options) {
-  const server = await createControlServer({ settingsPath: null, ...options });
+  const server = await createControlServer({ linesPath: null, settingsPath: null, ...options });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   t.after(() => new Promise((resolve, reject) => {
@@ -266,6 +266,30 @@ test('sustained incoming Opus interrupts before the turn ends and preserves its 
   assert.equal(sustained.pcm.length, 16 * 640);
 });
 
+test('saved lines survive a panel restart and previews use the selected saved wording', async (t) => {
+  const linesPath = join(tmpdir(), `discobuddy-lines-${randomUUID()}.json`);
+  t.after(() => rm(linesPath, { force: true }));
+  const spoken = [];
+  const first = await serve(t, {
+    linesPath,
+    synthesizeLine: async (_, line, settings) => { spoken.push({ line, voice: settings.voice }); return audio; },
+  });
+  assert.equal((await first.post('/api/lines', { text: ' First punchline! \n\nA question?\nFirst punchline!' })).status, 200);
+  assert.equal((await first.post('/api/line-preview', { index: 1, line: 'stale' })).status, 409);
+  const preview = await first.post('/api/line-preview', { index: 1, line: 'A question?' });
+  assert.equal(preview.status, 200);
+  assert.equal(preview.headers.get('content-type'), 'audio/wav');
+  assert.deepEqual(spoken, [{ line: 'A question?', voice: 'live' }]);
+
+  const restarted = await serve(t, { linesPath });
+  assert.deepEqual((await restarted.get('/api/status').then((res) => res.json())).lines, ['First punchline!', 'A question?']);
+  assert.equal((await restarted.get('/api/status').then((res) => res.json())).hangout, false);
+  assert.equal((await restarted.post('/api/lines', { text: 'x'.repeat(301) })).status, 400);
+  assert.equal((await first.post('/api/lines', { text: 'Replacement' })).status, 200);
+  const afterReplacement = await serve(t, { linesPath });
+  assert.deepEqual((await afterReplacement.get('/api/status').then((res) => res.json())).lines, ['Replacement']);
+});
+
 test('prompt drafts can be counted and previewed without changing saved Discord settings', async (t) => {
   const settingsPath = join(tmpdir(), `discobuddy-prompt-${randomUUID()}.json`);
   t.after(() => rm(settingsPath, { force: true }));
@@ -302,4 +326,75 @@ test('prompt drafts can be counted and previewed without changing saved Discord 
   assert.equal(restored.persona, original.persona);
   assert.equal(restored.guidelines, original.guidelines);
   assert.equal(restored.voice, 'live');
+});
+
+test('a spoken turn takes priority over pending and playing hangout lines', async (t) => {
+  let time = 0;
+  let timer;
+  let hooks;
+  let pendingSignal;
+  let playingHangout = false;
+  const deferred = Promise.withResolvers();
+  const played = [];
+  const status = { voice: 'ready', channelId, listening: true, people: 1, playing: false, capturing: false };
+  const { post, get } = await serve(t, {
+    token: 'fixture-token',
+    hangoutOptions: {
+      now: () => time,
+      schedule(fn, delay) { timer = { fn, at: time + delay }; return timer; },
+      unschedule(id) { if (timer === id) timer = undefined; },
+    },
+    makeBot: (_, _lost, callbacks) => {
+      hooks = callbacks;
+      return {
+        start() {}, status: () => ({ ...status }),
+        play(reply, speaker, options) {
+          played.push({ speaker, hangout: Boolean(options?.hangout) });
+          status.playing = true;
+          playingHangout = Boolean(options?.hangout);
+          callbacks.onActivityChanged();
+        },
+        stopHangout() {
+          if (playingHangout) { playingHangout = false; status.playing = false; callbacks.onActivityChanged(); }
+        },
+        close() {},
+      };
+    },
+    synthesizeLine: async (_, _line, _settings, signal) => {
+      if (!pendingSignal) { pendingSignal = signal; return deferred.promise; }
+      return audio;
+    },
+    synthesize: async () => audio,
+  });
+  assert.equal((await post('/api/lines', { text: 'A saved question?' })).status, 200);
+  assert.equal((await post('/api/hangout', { enabled: true })).status, 200);
+  time += 90_000;
+  timer.fn(); timer = undefined;
+  assert.ok(pendingSignal);
+  assert.equal((await get('/api/status').then((res) => res.json())).busy, true);
+  hooks.onHumanStart('alex');
+  assert.equal(pendingSignal.aborted, true);
+  hooks.onHumanSpeech('alex');
+  const speaker = { name: 'Alex', username: 'alex' };
+  hooks.onUtterance({ pcm: Buffer.alloc(2), rate: 16_000, speaker });
+  hooks.onHumanEnd('alex');
+  await new Promise(setImmediate);
+  assert.deepEqual(played, [{ speaker, hangout: false }]);
+  deferred.resolve(audio);
+  await new Promise(setImmediate);
+  assert.equal(played.length, 1);
+
+  status.playing = false;
+  hooks.onActivityChanged();
+  time += 90_000;
+  assert.ok(timer && timer.at <= time);
+  timer.fn(); timer = undefined;
+  await new Promise(setImmediate);
+  assert.equal(played.at(-1).hangout, true);
+  assert.equal(status.playing, true);
+  hooks.onHumanStart('alex');
+  assert.equal(status.playing, true); // Echo alone must not stop playback.
+  hooks.onHumanSpeech('alex');
+  assert.equal(status.playing, false);
+  hooks.onHumanEnd('alex');
 });

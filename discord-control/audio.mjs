@@ -67,20 +67,61 @@ export async function generateReply(modelPort, input, { persona, voice, speed, g
     if (reply.speechError || !reply.audioSeconds || reply.status === 'failed') {
       throw new Error('The reply did not contain playable speech.');
     }
-    const { audio, outputRate: rate } = reply;
-    if (speed === 1) return { audio, rate };
-    const stretch = new SpeechStretch(rate, speed);
-    const chunks = audio.map((bytes) => {
-      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-      const samples = Float32Array.from({ length: bytes.length / 2 }, (_, i) => view.getInt16(i * 2, true) / 32768);
-      return pcm16(stretch.append(samples));
-    });
-    chunks.push(pcm16(stretch.finish()));
-    return { audio: chunks, rate };
+    return changeSpeed(reply.audio, reply.outputRate, speed);
   } finally {
     signal.removeEventListener('abort', close);
     close();
   }
+}
+
+// Scripted lines must bypass the conversational model so its wording cannot change.
+// The original live voice is conversational only; use the female TTS voice for lines.
+export async function generateLine(modelPort, text, { voice, speed }, signal, request = fetch) {
+  signal.throwIfAborted();
+  const response = await request(`http://127.0.0.1:${modelPort}/v1/audio/speech`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ input: text, voice: voice === 'live' ? 'female' : voice, response_format: 'pcm', stream_format: 'audio' }),
+    signal: AbortSignal.any([signal, AbortSignal.timeout(120_000)]),
+  });
+  if (!response.ok) throw new Error('The local model could not synthesize the line.');
+  const type = response.headers.get('content-type') || '';
+  const rate = Number(/(?:^|;)\s*rate\s*=\s*(\d+)/i.exec(type)?.[1]);
+  if (!/^audio\/pcm(?:;|$)/i.test(type) || !Number.isInteger(rate) || rate < 8000 || rate > 192_000 ||
+      !/(?:^|;)\s*encoding\s*=\s*signed-int(?:;|$)/i.test(type) ||
+      !/(?:^|;)\s*bits\s*=\s*16(?:;|$)/i.test(type) || !response.body) {
+    throw new Error('The speech server returned an unsupported audio format.');
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      size += value.length;
+      if (size > rate * 2 * 45) throw new Error('The speech server returned an oversized line.');
+      chunks.push(value);
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+  signal.throwIfAborted();
+  if (!size || size % 2) throw new Error('The speech server returned incomplete audio.');
+  return changeSpeed([Buffer.concat(chunks)], rate, speed);
+}
+
+function changeSpeed(audio, rate, speed) {
+  if (speed === 1) return { audio, rate };
+  const stretch = new SpeechStretch(rate, speed);
+  const chunks = audio.map((bytes) => {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const samples = Float32Array.from({ length: bytes.length / 2 }, (_, i) => view.getInt16(i * 2, true) / 32768);
+    return pcm16(stretch.append(samples));
+  });
+  chunks.push(pcm16(stretch.finish()));
+  return { audio: chunks, rate };
 }
 
 export function previewWave({ audio, rate }) {

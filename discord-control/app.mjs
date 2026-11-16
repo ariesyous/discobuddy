@@ -4,10 +4,11 @@ import { defaultConversation, requiresAddress } from '/conversation.mjs';
 const $ = (id) => document.getElementById(id);
 const ui = Object.fromEntries([
   'settings', 'preset', 'persona', 'voice', 'speed', 'save', 'settings-status',
-  'reply-mode', 'interruptions', 'guidelines', 'reset-guidelines', 'prompt-count', 'turn-hint',
+  'reply-mode', 'interruptions', 'hangout', 'guidelines', 'reset-guidelines', 'prompt-count', 'turn-hint',
   'gateway', 'model', 'voice-status', 'voice-error', 'channel', 'join', 'leave',
   'listen', 'listen-status', 'listen-error',
   'speech', 'prompt', 'preview', 'speak', 'activity', 'preview-audio',
+  'line-bank', 'lines', 'save-lines', 'lines-status', 'line-select', 'line-preview', 'line-activity', 'line-audio',
 ].map((id) => [id, $(id)]));
 let state;
 let applied;
@@ -20,6 +21,10 @@ let settingsError = '';
 let saving = false;
 let generating = false;
 let previewUrl;
+let linePreviewUrl;
+let bankApplied;
+let bankSaving = false;
+let hangoutPending = false;
 let tokenRequestNumber = 0;
 let tokenTimer;
 let requestNumber = 0;
@@ -89,6 +94,11 @@ function render() {
   if (ui['settings-status'].textContent !== settingsText) ui['settings-status'].textContent = settingsText;
   ui.preview.disabled = !state?.modelReady || generating || state.busy || state.capturing;
   ui.speak.disabled = ui.preview.disabled || dirty || !ready || state.playing || Boolean(voiceAction);
+  if (!hangoutPending) ui.hangout.checked = Boolean(state?.hangout);
+  ui.hangout.disabled = !state || hangoutPending;
+  ui['save-lines'].disabled = !state || !bankApplied || ui.lines.value === bankApplied.join('\n') || bankSaving;
+  ui['line-select'].disabled = !bankApplied?.length || bankSaving;
+  ui['line-preview'].disabled = !state?.modelReady || !bankApplied?.length || generating || state.busy || state.capturing || bankSaving;
 }
 
 function renderListening(ready) {
@@ -131,6 +141,13 @@ async function refresh() {
     const modelChanged = Boolean(state?.modelReady) !== Boolean(updated.modelReady);
     state = updated;
     let countChanged = modelChanged;
+    if (!bankApplied || (!bankSaving && JSON.stringify(bankApplied) !== JSON.stringify(state.lines))) {
+      const follow = !bankApplied || ui.lines.value === bankApplied.join('\n');
+      bankApplied = state.lines;
+      if (follow) ui.lines.value = bankApplied.join('\n');
+      updateLineOptions();
+      if (follow) ui['lines-status'].textContent = 'Saved on this PC.';
+    }
     if (!applied || (!saving && !same(applied, state.settings))) {
       const first = !applied;
       const follow = first || same(applied, draft());
@@ -158,6 +175,76 @@ async function refresh() {
 function selectPreset() {
   ui.preset.value = Object.keys(presets).find((key) => presets[key] === ui.persona.value.trim()) ?? 'custom';
 }
+
+function updateLineOptions() {
+  const selected = ui['line-select'].selectedOptions[0]?.textContent;
+  ui['line-select'].replaceChildren();
+  if (!bankApplied.length) ui['line-select'].add(new Option('No saved lines', ''));
+  for (const [index, line] of bankApplied.entries()) ui['line-select'].add(new Option(line, String(index)));
+  const index = bankApplied.indexOf(selected);
+  if (index >= 0) ui['line-select'].value = String(index);
+}
+
+ui.hangout.addEventListener('change', async () => {
+  hangoutPending = true;
+  render();
+  try { await api('hangout', { enabled: ui.hangout.checked }); }
+  catch (error) { listenRequestError = error.message; }
+  finally { hangoutPending = false; await refresh(); }
+});
+
+ui.lines.addEventListener('input', () => {
+  ui['lines-status'].dataset.error = 'false';
+  ui['lines-status'].textContent = 'Save changes to use these lines.';
+  render();
+});
+ui['line-bank'].addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (ui['save-lines'].disabled) return;
+  const submitted = ui.lines.value;
+  bankSaving = true;
+  ++requestNumber;
+  render();
+  try {
+    bankApplied = (await (await api('lines', { text: submitted })).json()).lines;
+    if (ui.lines.value === submitted) ui.lines.value = bankApplied.join('\n');
+    updateLineOptions();
+    ui['lines-status'].dataset.error = 'false';
+    ui['lines-status'].textContent = 'Saved on this PC.';
+  } catch (error) {
+    ui['lines-status'].dataset.error = 'true';
+    ui['lines-status'].textContent = error.message;
+  } finally {
+    ++requestNumber;
+    bankSaving = false;
+    render();
+  }
+});
+ui['line-preview'].addEventListener('click', async () => {
+  if (ui['line-preview'].disabled) return;
+  generating = true;
+  if (linePreviewUrl) URL.revokeObjectURL(linePreviewUrl);
+  ui['line-audio'].removeAttribute('src');
+  ui['line-audio'].load();
+  ui['line-audio'].hidden = true;
+  ui['line-activity'].dataset.error = 'false';
+  ui['line-activity'].textContent = 'Generating speech on this PC…';
+  render();
+  try {
+    const index = Number(ui['line-select'].value);
+    const response = await api('line-preview', { index, line: bankApplied[index] });
+    linePreviewUrl = URL.createObjectURL(await response.blob());
+    ui['line-audio'].src = linePreviewUrl;
+    ui['line-audio'].hidden = false;
+    ui['line-activity'].textContent = 'Preview ready. Press play to listen.';
+  } catch (error) {
+    ui['line-activity'].dataset.error = 'true';
+    ui['line-activity'].textContent = error.message;
+  } finally {
+    generating = false;
+    await refresh();
+  }
+});
 
 function schedulePromptCount() {
   const number = ++tokenRequestNumber;
