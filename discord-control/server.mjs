@@ -8,7 +8,7 @@ import { createHangout } from './hangout.mjs';
 import { loadLines, parseLines, saveLines } from './lines.mjs';
 import { loadPrompt, savePrompt } from './prompt-settings.mjs';
 import {
-  addressedRequest, defaultConversation, interruptionModes, isStopRequest, MAX_PROMPT_FIELD, normalizeAliases,
+  addressedRequest, defaultConversation, interruptionModes, isGroupInvitation, isStopRequest, MAX_PROMPT_FIELD, normalizeAliases,
   PROMPT_TOKEN_BUDGET, relevantIntervals, replyModes, requiresAddress,
 } from './conversation.mjs';
 
@@ -174,7 +174,7 @@ export async function createControlServer({
           current.proactive = true;
           current.checkingRelevance = true;
           let relevant;
-          try { relevant = await decideRelevance(modelPort, { recent: previous, latest }, signal); }
+          try { relevant = isGroupInvitation(text) || await decideRelevance(modelPort, { recent: previous, latest }, signal); }
           catch {
             if (signal.aborted) signal.throwIfAborted();
             throw new RequestError(503, 'Could not decide whether to join the conversation. Check the local model.');

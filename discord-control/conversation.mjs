@@ -25,6 +25,13 @@ export function requiresAddress(replyMode, people) {
   return replyMode === 'addressed' || (replyMode === 'group' && people !== 1);
 }
 
+// Clear invitations to the whole group need not wait for a second model decision.
+export function isGroupInvitation(transcript) {
+  const text = transcript.trim();
+  if (/,\s*(?!(?:everyone|everybody|folks|guys|friends)\b)[\p{L}\p{N}][\p{L}\p{N}.'’ -]{0,39}[?!…]*$/iu.test(text)) return false;
+  return /^(?:(?:hey|hi)[,!]?\s+)?(?:(?:does|do|can|could|would)\s+(?:anyone|anybody)\s+(?:know|explain|suggest|recommend|think|remember)|(?:anyone|anybody)\s+(?:know|have\s+(?:any\s+)?(?:ideas|suggestions))|who\s+(?:knows|has\s+(?:an?\s+)?idea|can\s+(?:suggest|recommend))|what\s+do\s+(?:you\s+all|y['’]?all|everyone|everybody)\s+think)\b/iu.test(text);
+}
+
 const requestStart = /^(?:(?:can|could|will|would|do|did|are|have)\s+(?:you|we)|what|why|when|where|who|which|how|please|tell|give|explain|say|show|help|stop|wait|hold on|pause)\b/iu;
 
 function namePatterns(aliases) {

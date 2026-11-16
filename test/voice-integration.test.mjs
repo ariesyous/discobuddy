@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { assembleInstructions, countPromptTokens, generateLine, generateReply, shouldJoinConversation } from '../discord-control/audio.mjs';
+import { assembleInstructions, countPromptTokens, generateLine, generateReply, shouldJoinConversation, transcribeAudio } from '../discord-control/audio.mjs';
+import { addressedRequest } from '../discord-control/conversation.mjs';
 import { RealtimeSession } from '../local-chat/realtime.mjs';
 
 const server = process.env.DISCOBUDDY_TEST_URL;
@@ -169,10 +170,29 @@ test('real local model distinguishes group questions from side conversation', {
   for (const [text, expected] of [
     ['What cooperative game should we play?', true],
     ['Sam, did you finish your dinner?', false],
+    ['Sam, can you grab the key?', false],
+    ['What do you think, Sam?', false],
     ['Yeah, sounds good.', false],
     ['We are stuck on this puzzle. Any ideas?', true],
   ]) {
     const result = await shouldJoinConversation(port, { recent: [], latest: { speaker: 'Alex', text } }, AbortSignal.timeout(20_000), request);
     assert.equal(result, expected, text);
   }
+});
+
+test('a spoken alternative name survives local speech recognition', {
+  skip: !server && 'Set DISCOBUDDY_TEST_URL to a running local Voice Lab server.',
+  timeout: 120_000,
+}, async (t) => {
+  const base = new URL(server);
+  if (base.protocol !== 'http:' || !['127.0.0.1', 'localhost'].includes(base.hostname)) {
+    return t.skip('The Discord model connection uses a local HTTP server.');
+  }
+  const port = Number(base.port || 80);
+  const signal = AbortSignal.timeout(20_000);
+  const spoken = await generateLine(port, 'Hey Buddy, what is two plus two?', { voice: 'female', speed: 1 }, signal);
+  const transcript = await transcribeAudio(port, { pcm: Buffer.concat(spoken.audio), rate: spoken.rate }, signal);
+  const request = addressedRequest(transcript, 'Buddy');
+  assert.notEqual(request, null);
+  assert.match(request, /\b(?:two|2)\b/i);
 });

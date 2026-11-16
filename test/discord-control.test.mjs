@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
 import { discordPcm, shouldJoinConversation } from '../discord-control/audio.mjs';
-import { addressedRequest, defaultConversation } from '../discord-control/conversation.mjs';
+import { addressedRequest, defaultConversation, isGroupInvitation } from '../discord-control/conversation.mjs';
 import { createControlServer } from '../discord-control/server.mjs';
 
 const audio = { audio: [Buffer.from([0, 0, 0xD0, 7]), Buffer.from([0xBE, 0xFB])], rate: 24_000 };
@@ -173,6 +173,12 @@ test('recognizes a call for DiscoBuddy without treating a mention as a request',
   assert.equal(addressedRequest('Ask Buddy about the game.', 'Buddy'), null);
   assert.equal(addressedRequest('Hey C++, what is up?', 'C++'), 'what is up?');
   assert.equal(addressedRequest('Hey Ccc, what is up?', 'C++'), null);
+  assert.equal(isGroupInvitation('Does anyone know a good game?'), true);
+  assert.equal(isGroupInvitation('What do you all think about the map?'), true);
+  assert.equal(isGroupInvitation('Sam, does anyone know a good game?'), false);
+  assert.equal(isGroupInvitation('Does anyone know a good game, Sam?'), false);
+  assert.equal(isGroupInvitation('What do you all think, everyone?'), true);
+  assert.equal(isGroupInvitation('Can anyone pass the controller?'), false);
 });
 
 test('relevance decisions use a bounded JSON response and fail closed on invalid results', async () => {
@@ -320,6 +326,36 @@ test('relevant mode considers recent turns, respects cooldown, and still respond
   now += 90_001;
   await speak('What should we do now?');
   assert.deepEqual(decisions.at(-1).recent, []);
+});
+
+test('explicit group invitations can be answered without a second model decision', async (t) => {
+  let hooks;
+  let decisions = 0;
+  const replies = [];
+  let now = 1_000;
+  const speaker = { name: 'Alex', username: 'alex' };
+  const { post } = await serve(t, {
+    token: 'fixture-token', conversationNow: () => now,
+    makeBot: (_, _lost, callbacks) => {
+      hooks = callbacks;
+      return { start() {}, status: () => ({ voice: 'ready', channelId, listening: true, people: 2, playing: false }), play() {}, close() {} };
+    },
+    transcribe: async (_, input) => input.fixtureTranscript,
+    decideRelevance: async () => { decisions++; return false; },
+    synthesize: async (_, input) => { replies.push(input); return audio; },
+  });
+  assert.equal((await post('/api/settings', { persona: '', voice: 'live', speed: 1, replyMode: 'relevant' })).status, 200);
+  hooks.onActivityChanged();
+  const speech = (fixtureTranscript) => ({ pcm: Buffer.alloc(2), rate: 16_000, speaker, fixtureTranscript });
+  hooks.onUtterance(speech('Does anyone know a good game?'));
+  await new Promise(setImmediate);
+  assert.equal(replies.length, 1);
+  assert.equal(decisions, 0);
+  now += 30_001;
+  hooks.onUtterance(speech('Sam, does anyone know a good game?'));
+  await new Promise(setImmediate);
+  assert.equal(decisions, 1);
+  assert.equal(replies.length, 1);
 });
 
 test('speech starting during transcription cancels the pending relevant turn', async (t) => {
