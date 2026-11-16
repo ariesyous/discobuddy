@@ -18,8 +18,8 @@ class TestSocket extends EventTarget {
 
 const sessionInfo = { audio: { input: { format: { rate: 16000 } }, output: { format: { rate: 24000 } } } };
 
-async function start(persona = 'Be a patient coach.', { voice = 'live', request } = {}) {
-  const chat = new RealtimeSession('ws://127.0.0.1:8765/v1/realtime', { Socket: TestSocket, fetch: request });
+async function start(persona = 'Be a patient coach.', { voice = 'live', request, releaseBeforeSpeech = false } = {}) {
+  const chat = new RealtimeSession('ws://127.0.0.1:8765/v1/realtime', { Socket: TestSocket, fetch: request, releaseBeforeSpeech });
   const opening = chat.open(persona, voice);
   if (voice !== 'live') await new Promise(setImmediate);
   const wire = TestSocket.current;
@@ -258,6 +258,54 @@ test('streams complete sentences in the selected voice, aligns PCM chunks, and u
   await second;
   assert.equal(server.calls.at(-1).voice, 'female');
   assert.match(next.wire.events[0].session.instructions, /A different persona\.$/);
+});
+
+test('releases a disposable conversation slot before generating the selected voice', async (t) => {
+  const server = speechServer();
+  let wire;
+  const request = (url, options) => {
+    if (url.pathname === '/v1/audio/speech') assert.equal(wire.readyState, 3);
+    return server.request(url, options);
+  };
+  const session = await start('Test', { voice: 'male', request, releaseBeforeSpeech: true });
+  const { chat } = session;
+  wire = session.wire;
+  t.after(() => chat.close());
+  const answer = chat.ask('Hello');
+  wire.emit('response.output_text.delta', { delta: 'Hello. How are you?' });
+  await new Promise(setImmediate);
+  assert.deepEqual(server.calls, []);
+  wire.emit('response.done', { response: { status: 'completed' } });
+  wire.dispatchEvent(new Event('close'));
+  const result = await answer;
+  assert.equal(result.status, 'completed');
+  assert.equal(result.text, 'Hello. How are you?');
+  assert.ok(result.audioSeconds > 0);
+  assert.deepEqual(server.calls.map(({ input, voice }) => [input, voice]),
+    [['Hello.', 'male'], ['How are you?', 'male']]);
+  assert.equal(chat.ready, false);
+});
+
+test('cancels selected-voice synthesis after releasing the conversation slot', async (t) => {
+  let speechStarted = false;
+  let aborted = false;
+  const request = async (url, options = {}) => {
+    if (url.pathname === '/props') return Response.json({ voices: ['male'], total_slots: 2 });
+    speechStarted = true;
+    return new Promise((resolve, reject) => options.signal.addEventListener('abort', () => {
+      aborted = true;
+      reject(new DOMException('Aborted', 'AbortError'));
+    }, { once: true }));
+  };
+  const { chat, wire } = await start('Test', { voice: 'male', request, releaseBeforeSpeech: true });
+  t.after(() => chat.close());
+  const answer = chat.ask('Hello');
+  wire.emit('response.output_text.delta', { delta: 'Hello.' });
+  wire.emit('response.done', { response: { status: 'completed' } });
+  await eventually(() => speechStarted);
+  chat.cancel();
+  assert.equal(aborted, true);
+  assert.equal((await answer).status, 'cancelled');
 });
 
 test('rejects unavailable voices and a server with only one slot', async () => {

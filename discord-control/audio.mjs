@@ -48,7 +48,7 @@ export async function countPromptTokens(modelPort, settings, request = fetch) {
 
 export async function generateReply(modelPort, input, { persona, voice, speed, guidelines = defaultConversation.guidelines }, signal) {
   signal.throwIfAborted();
-  const session = new RealtimeSession(`ws://127.0.0.1:${modelPort}/v1/realtime`);
+  const session = new RealtimeSession(`ws://127.0.0.1:${modelPort}/v1/realtime`, { releaseBeforeSpeech: true });
   const close = () => session.close();
   signal.addEventListener('abort', close, { once: true });
   try {

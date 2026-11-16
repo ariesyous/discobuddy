@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { assembleInstructions, countPromptTokens } from '../discord-control/audio.mjs';
+import { assembleInstructions, countPromptTokens, generateReply } from '../discord-control/audio.mjs';
 import { RealtimeSession } from '../local-chat/realtime.mjs';
 
 const server = process.env.DISCOBUDDY_TEST_URL;
@@ -121,5 +121,28 @@ test('real local model handles a spoken turn with a 1,500-token prompt', {
     assert.match(result.text, /\bkoala\b/i);
   } finally {
     chat.close();
+  }
+});
+
+test('Discord generates the male voice while another model session is open', {
+  skip: !server && 'Set DISCOBUDDY_TEST_URL to a running local Voice Lab server.',
+  timeout: 120_000,
+}, async (t) => {
+  const base = new URL(server);
+  if (base.protocol !== 'http:' || !['127.0.0.1', 'localhost'].includes(base.hostname)) {
+    return t.skip('The Discord model connection uses a local HTTP server.');
+  }
+  const socket = new URL('/v1/realtime', base);
+  socket.protocol = 'ws:';
+  const otherSession = new RealtimeSession(socket);
+  try {
+    await otherSession.open('Keep replies short.');
+    const result = await generateReply(Number(base.port || 80), 'What is two plus two?', {
+      persona: 'Keep replies short.', voice: 'male', speed: 1,
+    }, AbortSignal.timeout(100_000));
+    assert.equal(result.rate, 24_000);
+    assert.ok(result.audio.reduce((total, bytes) => total + bytes.length, 0) > 4800);
+  } finally {
+    otherSession.close();
   }
 });
