@@ -30,7 +30,19 @@
           <option value="group">When called in groups</option>
           <option value="addressed">Only when called</option>
           <option value="open">After every spoken turn</option>
+          <option value="relevant">Join when relevant</option>
         </select>
+        <p class="small">Relevant mode uses the local model to choose when to help; it can misread the conversation. It yields to people speaking, and calling by name still works during the pause.</p>
+        <label for="relevant-interval">Pause between unprompted replies</label>
+        <select id="relevant-interval">
+          <option value="15">15 seconds</option>
+          <option value="30" selected>30 seconds</option>
+          <option value="60">1 minute</option>
+          <option value="120">2 minutes</option>
+        </select>
+        <label for="aliases">Alternative names</label>
+        <textarea id="aliases" rows="2" maxlength="400" placeholder="Buddy&#10;DJ"></textarea>
+        <p class="small">One name per line. DiscoBuddy also remains available.</p>
         <label for="interruptions">Interrupt replies</label>
         <select id="interruptions">
           <option value="addressed">Only when called</option>

@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { rm } from 'node:fs/promises';
+import { rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
-import { discordPcm } from '../discord-control/audio.mjs';
+import { discordPcm, shouldJoinConversation } from '../discord-control/audio.mjs';
 import { addressedRequest, defaultConversation } from '../discord-control/conversation.mjs';
 import { createControlServer } from '../discord-control/server.mjs';
 
@@ -166,6 +166,29 @@ test('recognizes a call for DiscoBuddy without treating a mention as a request',
   assert.equal(addressedRequest('Disco Buddy is listening.'), null);
   assert.equal(addressedRequest('Sam, ask DiscoBuddy about the game.'), null);
   assert.equal(addressedRequest('Is DiscoBuddy listening?'), null);
+  assert.equal(addressedRequest('Hey DJ, can we play?', 'Buddy\nDJ'), 'can we play?');
+  assert.equal(addressedRequest('What do you think, Buddy?', 'Buddy\nDJ'), 'What do you think');
+  assert.equal(addressedRequest('DJ, stop.', 'DJ'), 'stop.');
+  assert.equal(addressedRequest('Buddy is listening.', 'Buddy'), null);
+  assert.equal(addressedRequest('Ask Buddy about the game.', 'Buddy'), null);
+  assert.equal(addressedRequest('Hey C++, what is up?', 'C++'), 'what is up?');
+  assert.equal(addressedRequest('Hey Ccc, what is up?', 'C++'), null);
+});
+
+test('relevance decisions use a bounded JSON response and fail closed on invalid results', async () => {
+  const latest = { speaker: 'Alex', text: 'What game should we play?' };
+  const recent = [{ speaker: 'Sam', text: 'We need a new game.' }];
+  let sent;
+  const request = async (url, options) => {
+    assert.equal(url, 'http://127.0.0.1:8765/v1/chat/completions');
+    sent = JSON.parse(options.body);
+    return Response.json({ choices: [{ finish_reason: 'stop', message: { content: '{"respond":true}' } }] });
+  };
+  assert.equal(await shouldJoinConversation(8765, { recent, latest }, new AbortController().signal, request), true);
+  assert.deepEqual(JSON.parse(sent.messages[1].content), { recent, latest });
+  assert.equal(sent.response_format.schema.properties.respond.type, 'boolean');
+  await assert.rejects(shouldJoinConversation(8765, { recent, latest }, new AbortController().signal,
+    async () => Response.json({ choices: [{ finish_reason: 'stop', message: { content: '{"respond":"yes"}' } }] })), /invalid conversation decision/);
 });
 
 test('group turns stay quiet unless called and side talk cannot stop a reply in addressed mode', async (t) => {
@@ -228,6 +251,230 @@ test('group turns stay quiet unless called and side talk cannot stop a reply in 
   const open = await speak('What happened in the last round?');
   assert.equal(conversations.at(-1).input, open);
   assert.equal(conversations.length, 3);
+});
+
+test('relevant mode considers recent turns, respects cooldown, and still responds to an alias', async (t) => {
+  const decisions = [];
+  const replies = [];
+  const plays = [];
+  let now = 10_000;
+  let hooks;
+  let people = 2;
+  let speaking = false;
+  const speaker = { name: 'Alex', username: 'alex' };
+  const status = () => ({ voice: 'ready', channelId, listening: true, people, playing: false, capturing: false, speaking });
+  const { post, get } = await serve(t, {
+    token: 'fixture-token', conversationNow: () => now,
+    makeBot: (_, _lost, callbacks) => {
+      hooks = callbacks;
+      return { start() {}, status, play: (_reply, _speaker, options) => plays.push(options), close() {} };
+    },
+    transcribe: async (_, input) => input.fixtureTranscript,
+    decideRelevance: async (_, context) => { decisions.push(context); return context.latest.text.includes('?') && !context.latest.text.startsWith('Sam,'); },
+    synthesize: async (_, input) => { replies.push(input); return audio; },
+  });
+  const options = { persona: 'Friendly.', voice: 'live', speed: 1, replyMode: 'relevant', aliases: 'Buddy\nDJ', relevantInterval: 15 };
+  assert.equal((await post('/api/settings', options)).status, 200);
+  hooks.onActivityChanged();
+  async function speak(fixtureTranscript, overlap) {
+    hooks.onUtterance({ pcm: Buffer.alloc(2), rate: 16_000, speaker, fixtureTranscript }, overlap);
+    await new Promise(setImmediate);
+  }
+  await speak('Sam, are you ready?');
+  assert.equal(replies.length, 0);
+  speaking = true;
+  await speak('What are we discussing?');
+  assert.equal(decisions.length, 1);
+  speaking = false;
+  await speak('What game should we play?');
+  assert.equal(replies.length, 1);
+  assert.deepEqual(decisions[1].recent, [
+    { speaker: 'Alex', text: 'Sam, are you ready?' },
+    { speaker: 'Alex', text: 'What are we discussing?' },
+  ]);
+  assert.deepEqual(replies[0], {
+    text: 'What game should we play?', speaker,
+    context: [{ speaker: 'Alex', text: 'Sam, are you ready?' }, { speaker: 'Alex', text: 'What are we discussing?' }],
+  });
+  assert.deepEqual(plays[0], { proactive: true });
+  await speak('What is another good game?');
+  assert.equal(decisions.length, 2);
+  await speak('Buddy, what is the score?');
+  assert.deepEqual(replies[1], { text: 'what is the score?', speaker });
+  assert.deepEqual(plays[1], { proactive: false });
+  let stopped = false;
+  await speak('DJ, stop.', { mode: 'addressed', stop() { stopped = true; } });
+  assert.equal(stopped, true);
+  assert.equal(replies.length, 2);
+  now += 15_001;
+  await speak('What should we try next?');
+  assert.equal(replies.length, 3);
+  assert.equal((await get('/api/status').then((res) => res.text())).includes('What game should we play?'), false);
+
+  people = 0;
+  hooks.onActivityChanged();
+  people = 2;
+  hooks.onActivityChanged();
+  await speak('Who wants to join?');
+  assert.deepEqual(decisions.at(-1).recent, []);
+  now += 90_001;
+  await speak('What should we do now?');
+  assert.deepEqual(decisions.at(-1).recent, []);
+});
+
+test('speech starting during transcription cancels the pending relevant turn', async (t) => {
+  let hooks;
+  let pendingSignal;
+  const pending = Promise.withResolvers();
+  const played = [];
+  const speaker = { name: 'Alex', username: 'alex' };
+  const { post } = await serve(t, {
+    token: 'fixture-token',
+    makeBot: (_, _lost, callbacks) => {
+      hooks = callbacks;
+      return { start() {}, status: () => ({ voice: 'ready', channelId, listening: true, people: 2, playing: false }), play: () => played.push(true), close() {} };
+    },
+    transcribe: async (_, input, signal) => {
+      if (input.fixtureTranscript === 'pending') { pendingSignal = signal; return pending.promise; }
+      return input.fixtureTranscript;
+    },
+    decideRelevance: async () => true,
+    synthesize: async () => audio,
+  });
+  assert.equal((await post('/api/settings', { persona: '', voice: 'live', speed: 1, replyMode: 'relevant', aliases: 'Buddy' })).status, 200);
+  hooks.onActivityChanged();
+  const speech = (fixtureTranscript) => ({ pcm: Buffer.alloc(2), rate: 16_000, speaker, fixtureTranscript });
+  hooks.onUtterance(speech('pending'));
+  await new Promise(setImmediate);
+  hooks.onHumanStart('alex');
+  assert.equal(pendingSignal.aborted, true);
+  hooks.onUtterance(speech('Buddy, what time is it?'));
+  await new Promise(setImmediate);
+  assert.deepEqual(played, [true]);
+  pending.resolve('What should we play?');
+  await new Promise(setImmediate);
+  assert.deepEqual(played, [true]);
+});
+
+test('new speech cancels a proactive decision and leaves the next addressed turn available', async (t) => {
+  let hooks;
+  let pendingSignal;
+  const pending = Promise.withResolvers();
+  const replies = [];
+  const speaker = { name: 'Alex', username: 'alex' };
+  const { post } = await serve(t, {
+    token: 'fixture-token',
+    makeBot: (_, _lost, callbacks) => {
+      hooks = callbacks;
+      return { start() {}, status: () => ({ voice: 'ready', channelId, listening: true, people: 2, playing: false }), play() {}, close() {} };
+    },
+    transcribe: async (_, input) => input.fixtureTranscript,
+    decideRelevance: async (_, _context, signal) => { pendingSignal = signal; return pending.promise; },
+    synthesize: async (_, input) => { replies.push(input); return audio; },
+  });
+  assert.equal((await post('/api/settings', { persona: '', voice: 'live', speed: 1, replyMode: 'relevant', aliases: 'Buddy' })).status, 200);
+  hooks.onActivityChanged();
+  const speech = (fixtureTranscript) => ({ pcm: Buffer.alloc(2), rate: 16_000, speaker, fixtureTranscript });
+  hooks.onUtterance(speech('What should we play?'));
+  await new Promise(setImmediate);
+  assert.ok(pendingSignal);
+  hooks.onHumanStart('alex');
+  assert.equal(pendingSignal.aborted, true);
+  hooks.onUtterance(speech('Buddy, what time is it?'));
+  await new Promise(setImmediate);
+  assert.deepEqual(replies, [{ text: 'what time is it?', speaker }]);
+  pending.resolve(true);
+  await new Promise(setImmediate);
+  assert.equal(replies.length, 1);
+});
+
+test('new speech cancels a proactive reply being generated', async (t) => {
+  let hooks;
+  let pendingSignal;
+  const pending = Promise.withResolvers();
+  const played = [];
+  const speaker = { name: 'Alex', username: 'alex' };
+  const { post } = await serve(t, {
+    token: 'fixture-token',
+    makeBot: (_, _lost, callbacks) => {
+      hooks = callbacks;
+      return { start() {}, status: () => ({ voice: 'ready', channelId, listening: true, people: 2, playing: false }), play: (_reply, person) => played.push(person), close() {} };
+    },
+    transcribe: async (_, input) => input.fixtureTranscript,
+    decideRelevance: async () => true,
+    synthesize: async (_, input, _settings, signal) => {
+      if (input.text === 'What should we play?') { pendingSignal = signal; return pending.promise; }
+      return audio;
+    },
+  });
+  assert.equal((await post('/api/settings', { persona: '', voice: 'live', speed: 1, replyMode: 'relevant', aliases: 'Buddy' })).status, 200);
+  hooks.onActivityChanged();
+  const speech = (fixtureTranscript) => ({ pcm: Buffer.alloc(2), rate: 16_000, speaker, fixtureTranscript });
+  hooks.onUtterance(speech('What should we play?'));
+  await new Promise(setImmediate);
+  assert.ok(pendingSignal);
+  hooks.onHumanStart('alex');
+  assert.equal(pendingSignal.aborted, true);
+  hooks.onUtterance(speech('Buddy, tell me a joke.'));
+  await new Promise(setImmediate);
+  assert.deepEqual(played, [speaker]);
+  pending.resolve(audio);
+  await new Promise(setImmediate);
+  assert.deepEqual(played, [speaker]);
+});
+
+test('turning off relevant mode cancels a pending unsolicited decision', async (t) => {
+  let hooks;
+  let pendingSignal;
+  const pending = Promise.withResolvers();
+  let plays = 0;
+  const { post } = await serve(t, {
+    token: 'fixture-token',
+    makeBot: (_, _lost, callbacks) => {
+      hooks = callbacks;
+      return { start() {}, status: () => ({ voice: 'ready', channelId, listening: true, people: 2, playing: false }), play: () => plays++, close() {} };
+    },
+    transcribe: async () => 'What should we play?',
+    decideRelevance: async (_, _context, signal) => { pendingSignal = signal; return pending.promise; },
+    synthesize: async () => audio,
+  });
+  const settings = { persona: '', voice: 'live', speed: 1, replyMode: 'relevant' };
+  assert.equal((await post('/api/settings', settings)).status, 200);
+  hooks.onActivityChanged();
+  hooks.onUtterance({ pcm: Buffer.alloc(2), rate: 16_000, speaker: { name: 'Alex', username: 'alex' } });
+  await new Promise(setImmediate);
+  assert.ok(pendingSignal);
+  assert.equal((await post('/api/settings', { ...settings, replyMode: 'group' })).status, 200);
+  assert.equal(pendingSignal.aborted, true);
+  pending.resolve(true);
+  await new Promise(setImmediate);
+  assert.equal(plays, 0);
+});
+
+test('a failed relevance check stays quiet and a direct call can still be answered', async (t) => {
+  let hooks;
+  const replies = [];
+  const speaker = { name: 'Alex', username: 'alex' };
+  const { get, post } = await serve(t, {
+    token: 'fixture-token',
+    makeBot: (_, _lost, callbacks) => {
+      hooks = callbacks;
+      return { start() {}, status: () => ({ voice: 'ready', channelId, listening: true, people: 2, playing: false }), play() {}, close() {} };
+    },
+    transcribe: async (_, input) => input.fixtureTranscript,
+    decideRelevance: async () => { throw new Error('Model unavailable'); },
+    synthesize: async (_, input) => { replies.push(input); return audio; },
+  });
+  assert.equal((await post('/api/settings', { persona: '', voice: 'live', speed: 1, replyMode: 'relevant', aliases: 'Buddy' })).status, 200);
+  hooks.onActivityChanged();
+  const speech = (fixtureTranscript) => ({ pcm: Buffer.alloc(2), rate: 16_000, speaker, fixtureTranscript });
+  hooks.onUtterance(speech('What should we play?'));
+  await new Promise(setImmediate);
+  assert.equal(replies.length, 0);
+  assert.match((await get('/api/status').then((res) => res.json())).listenError, /Could not decide/);
+  hooks.onUtterance(speech('Buddy, tell me a joke.'));
+  await new Promise(setImmediate);
+  assert.deepEqual(replies, [{ text: 'tell me a joke.', speaker }]);
 });
 
 test('sustained incoming Opus interrupts before the turn ends and preserves its first samples', async (t) => {
@@ -293,7 +540,7 @@ test('saved lines survive a panel restart and previews use the selected saved wo
 test('prompt drafts can be counted and previewed without changing saved Discord settings', async (t) => {
   const settingsPath = join(tmpdir(), `discobuddy-prompt-${randomUUID()}.json`);
   t.after(() => rm(settingsPath, { force: true }));
-  const original = { persona: 'A'.repeat(3000), guidelines: 'B'.repeat(2000), voice: 'live', speed: 1 };
+  const original = { persona: 'A'.repeat(3000), guidelines: 'B'.repeat(2000), voice: 'live', speed: 1, replyMode: 'relevant', aliases: 'Buddy\nDJ', relevantInterval: 60 };
   const draft = { ...original, persona: 'Draft persona', guidelines: 'Draft guidance', voice: 'female' };
   const generated = [];
   const counts = [];
@@ -320,12 +567,24 @@ test('prompt drafts can be counted and previewed without changing saved Discord 
   assert.equal(generated[1].settings.guidelines, original.guidelines);
   assert.equal((await post('/api/preview', { prompt: 'Hello', settings: null })).status, 400);
   assert.equal((await post('/api/prompt-tokens', { persona: 'x'.repeat(12_001), guidelines: '' })).status, 400);
+  assert.equal((await post('/api/settings', { ...original, aliases: 'x'.repeat(41) })).status, 400);
+  assert.equal((await post('/api/settings', { ...original, relevantInterval: 1 })).status, 400);
 
   const restarted = await serve(t, { settingsPath });
   const restored = (await restarted.get('/api/status').then((res) => res.json())).settings;
   assert.equal(restored.persona, original.persona);
   assert.equal(restored.guidelines, original.guidelines);
   assert.equal(restored.voice, 'live');
+  assert.equal(restored.replyMode, 'relevant');
+  assert.equal(restored.aliases, 'Buddy\nDJ');
+  assert.equal(restored.relevantInterval, 60);
+  await writeFile(settingsPath, JSON.stringify({ persona: 'Existing persona', guidelines: 'Existing guidance' }));
+  const legacy = await serve(t, { settingsPath });
+  const migrated = (await legacy.get('/api/status').then((res) => res.json())).settings;
+  assert.equal(migrated.persona, 'Existing persona');
+  assert.equal(migrated.aliases, '');
+  assert.equal(migrated.replyMode, 'group');
+  assert.equal(migrated.relevantInterval, 30);
 });
 
 test('a spoken turn takes priority over pending and playing hangout lines', async (t) => {

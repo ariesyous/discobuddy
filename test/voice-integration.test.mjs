@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { assembleInstructions, countPromptTokens, generateLine, generateReply } from '../discord-control/audio.mjs';
+import { assembleInstructions, countPromptTokens, generateLine, generateReply, shouldJoinConversation } from '../discord-control/audio.mjs';
 import { RealtimeSession } from '../local-chat/realtime.mjs';
 
 const server = process.env.DISCOBUDDY_TEST_URL;
@@ -157,4 +157,22 @@ test('real local model synthesizes a saved line directly', {
   const result = await generateLine(port, 'What game could you play forever?', { voice: 'live', speed: 1 }, new AbortController().signal, request);
   assert.equal(result.rate, 24_000);
   assert.ok(Buffer.concat(result.audio).length > result.rate, 'The saved line should contain audible speech.');
+});
+
+test('real local model distinguishes group questions from side conversation', {
+  skip: !server && 'Set DISCOBUDDY_TEST_URL to a running local Voice Lab server.',
+  timeout: 120_000,
+}, async () => {
+  const base = new URL(server);
+  const port = Number(base.port || (base.protocol === 'https:' ? 443 : 80));
+  const request = (url, options) => fetch(new URL(new URL(url).pathname, base), options);
+  for (const [text, expected] of [
+    ['What cooperative game should we play?', true],
+    ['Sam, did you finish your dinner?', false],
+    ['Yeah, sounds good.', false],
+    ['We are stuck on this puzzle. Any ideas?', true],
+  ]) {
+    const result = await shouldJoinConversation(port, { recent: [], latest: { speaker: 'Alex', text } }, AbortSignal.timeout(20_000), request);
+    assert.equal(result, expected, text);
+  }
 });

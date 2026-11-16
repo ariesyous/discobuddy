@@ -1,10 +1,10 @@
 import { presets } from '/personas.mjs';
-import { defaultConversation, requiresAddress } from '/conversation.mjs';
+import { defaultConversation, normalizeAliases, requiresAddress } from '/conversation.mjs';
 
 const $ = (id) => document.getElementById(id);
 const ui = Object.fromEntries([
   'settings', 'preset', 'persona', 'voice', 'speed', 'save', 'settings-status',
-  'reply-mode', 'interruptions', 'hangout', 'guidelines', 'reset-guidelines', 'prompt-count', 'turn-hint',
+  'reply-mode', 'relevant-interval', 'aliases', 'interruptions', 'hangout', 'guidelines', 'reset-guidelines', 'prompt-count', 'turn-hint',
   'gateway', 'model', 'voice-status', 'voice-error', 'channel', 'join', 'leave',
   'listen', 'listen-status', 'listen-error',
   'speech', 'prompt', 'preview', 'speak', 'activity', 'preview-audio',
@@ -38,9 +38,13 @@ async function api(path, body) {
 }
 
 function draft() {
+  let aliases;
+  try { aliases = normalizeAliases(ui.aliases.value); }
+  catch { aliases = ui.aliases.value.trim(); }
   return {
     persona: ui.persona.value.trim(), voice: ui.voice.value, speed: Number(ui.speed.value),
-    replyMode: ui['reply-mode'].value, interruptions: ui.interruptions.value, guidelines: ui.guidelines.value.trim(),
+    replyMode: ui['reply-mode'].value, interruptions: ui.interruptions.value, aliases,
+    relevantInterval: Number(ui['relevant-interval'].value), guidelines: ui.guidelines.value.trim(),
   };
 }
 
@@ -89,6 +93,7 @@ function render() {
   if (ui['voice-error'].textContent !== voiceError) ui['voice-error'].textContent = voiceError;
   renderListening(ready);
   const dirty = !same(applied, draft());
+  ui['relevant-interval'].disabled = ui['reply-mode'].value !== 'relevant';
   ui.save.disabled = !state || !dirty || saving;
   const settingsText = settingsError || (!applied ? 'Waiting for the panel.' : dirty ? 'Preview this draft, or apply it for Discord replies.' : 'Applied for the next reply.');
   if (ui['settings-status'].textContent !== settingsText) ui['settings-status'].textContent = settingsText;
@@ -110,9 +115,11 @@ function renderListening(ready) {
   const name = speaker && (speaker.name === speaker.username ? speaker.name : `${speaker.name} (@${speaker.username})`);
   const conversation = state?.settings ?? defaultConversation;
   const callNeeded = requiresAddress(conversation.replyMode, state?.people);
-  const turnHint = callNeeded ? 'Start the turn with “DiscoBuddy,” ask your question, then pause.' : 'Speak in Discord, then pause for a reply.';
+  const nameHint = conversation.aliases ? '“DiscoBuddy” or an alternative name' : '“DiscoBuddy”';
+  const turnHint = callNeeded ? `Start the turn with ${nameHint}, ask your question, then pause.`
+    : conversation.replyMode === 'relevant' ? `Speak naturally, or call ${nameHint} for a direct reply.` : 'Speak in Discord, then pause for a reply.';
   const interruptionHint = {
-    addressed: 'Say “DiscoBuddy, stop” and pause to cut in.',
+    addressed: 'Say its name followed by “stop” and pause to cut in.',
     any: 'Speak over DiscoBuddy to cut in.',
     finish: 'Wait for its reply to finish before speaking.',
   };
@@ -121,11 +128,13 @@ function renderListening(ready) {
   let text = 'Listening is off.';
   if (listening) {
     if (state.capturing) text = `Hearing ${name}…`;
+    else if (state.checkingRelevance) text = 'Deciding whether to join the conversation…';
     else if (state.checkingSpeech) text = 'Checking the spoken turn…';
     else if (state.responding) text = `Generating a reply to ${name}…`;
     else if (state.playing) text = name ? `Replying to ${name}.` : 'Discobuddy is speaking.';
     else if (!ready) text = 'Waiting for the voice connection…';
-    else text = callNeeded ? 'Waiting to be called by name.' : 'Listening to the voice channel.';
+    else text = callNeeded ? 'Waiting to be called by name.' : conversation.replyMode === 'relevant'
+      ? 'Listening for a chance to join.' : 'Listening to the voice channel.';
   }
   if (ui['listen-status'].textContent !== text) ui['listen-status'].textContent = text;
   const error = listenRequestError || state?.listenError || '';
@@ -157,6 +166,8 @@ async function refresh() {
         ui.voice.value = applied.voice;
         ui.speed.value = applied.speed;
         ui['reply-mode'].value = applied.replyMode;
+        ui['relevant-interval'].value = applied.relevantInterval;
+        ui.aliases.value = applied.aliases;
         ui.interruptions.value = applied.interruptions;
         ui.guidelines.value = applied.guidelines;
         selectPreset();
@@ -264,7 +275,7 @@ function schedulePromptCount() {
       ui['prompt-count'].dataset.error = String(count > budget);
       ui['prompt-count'].textContent = count > budget
         ? `${count.toLocaleString()} prompt tokens: above the ${budget.toLocaleString()}-token target. Shorten the draft to leave room for speech, the reply, and formatting.`
-        : `${count.toLocaleString()} / ${budget.toLocaleString()} suggested prompt tokens. The rest of the 4,096-token session is shared by speech, reply, speaker details, and formatting.`;
+        : `${count.toLocaleString()} / ${budget.toLocaleString()} suggested prompt tokens. The rest of the 4,096-token session is shared by speech, reply, speaker details, recent conversation, and formatting.`;
     } catch {
       if (number === tokenRequestNumber) ui['prompt-count'].textContent = 'Token count unavailable. Check the local model.';
     }
@@ -278,8 +289,9 @@ ui.preset.addEventListener('change', () => {
   settingsEdited();
 });
 ui.persona.addEventListener('input', () => { selectPreset(); settingsEdited(); });
-for (const el of [ui.voice, ui.speed, ui['reply-mode'], ui.interruptions]) el.addEventListener('change', settingsEdited);
+for (const el of [ui.voice, ui.speed, ui['reply-mode'], ui['relevant-interval'], ui.interruptions]) el.addEventListener('change', settingsEdited);
 ui.guidelines.addEventListener('input', settingsEdited);
+ui.aliases.addEventListener('input', settingsEdited);
 ui['reset-guidelines'].addEventListener('click', () => {
   ui.guidelines.value = defaultConversation.guidelines;
   settingsEdited();

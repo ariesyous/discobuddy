@@ -3,12 +3,13 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { presets } from '../local-chat/personas.mjs';
 import { VOICES } from '../local-chat/realtime.mjs';
-import { countPromptTokens, generateLine, generateReply, previewWave, transcribeAudio } from './audio.mjs';
+import { countPromptTokens, generateLine, generateReply, previewWave, shouldJoinConversation, transcribeAudio } from './audio.mjs';
 import { createHangout } from './hangout.mjs';
 import { loadLines, parseLines, saveLines } from './lines.mjs';
 import { loadPrompt, savePrompt } from './prompt-settings.mjs';
 import {
-  addressedRequest, defaultConversation, interruptionModes, isStopRequest, MAX_PROMPT_FIELD, PROMPT_TOKEN_BUDGET, replyModes, requiresAddress,
+  addressedRequest, defaultConversation, interruptionModes, isStopRequest, MAX_PROMPT_FIELD, normalizeAliases,
+  PROMPT_TOKEN_BUDGET, relevantIntervals, replyModes, requiresAddress,
 } from './conversation.mjs';
 
 const host = '127.0.0.1';
@@ -62,21 +63,25 @@ function validateSettings(body, current) {
   }
   const {
     persona, voice, speed, replyMode = current.replyMode,
-    interruptions = current.interruptions, guidelines = current.guidelines,
+    interruptions = current.interruptions, guidelines = current.guidelines, aliases = current.aliases,
+    relevantInterval = current.relevantInterval,
   } = body;
   if (!validPrompt({ persona, guidelines })) {
     throw new RequestError(400, 'Limit persona and guidelines to 12,000 characters each.');
   }
   if (!VOICES.includes(voice) || !speeds.includes(speed) ||
-      !replyModes.includes(replyMode) || !interruptionModes.includes(interruptions)) {
+      !replyModes.includes(replyMode) || !interruptionModes.includes(interruptions) || !relevantIntervals.includes(relevantInterval)) {
     throw new RequestError(400, 'Choose supported voice and conversation settings.');
   }
-  return { persona: persona.trim(), voice, speed, replyMode, interruptions, guidelines: guidelines.trim() };
+  let normalizedAliases;
+  try { normalizedAliases = normalizeAliases(aliases); }
+  catch (error) { throw new RequestError(400, error.message); }
+  return { persona: persona.trim(), voice, speed, replyMode, interruptions, aliases: normalizedAliases, relevantInterval, guidelines: guidelines.trim() };
 }
 
 export async function createControlServer({
   modelPort = 8765, token = '', synthesize = generateReply, synthesizeLine = generateLine, transcribe = transcribeAudio, makeBot,
-  countTokens = countPromptTokens,
+  countTokens = countPromptTokens, decideRelevance = shouldJoinConversation, conversationNow = Date.now,
   linesPath = fileURLToPath(new URL('../.local-runtime/discord-lines.json', import.meta.url)),
   settingsPath = fileURLToPath(new URL('../.local-runtime/discord-prompt.json', import.meta.url)), hangoutOptions = {},
 } = {}) {
@@ -89,20 +94,53 @@ export async function createControlServer({
   let bot;
   let hangout;
   let listenError = '';
+  let recentTurns = [];
+  let contextChannel = null;
+  let contextTimer;
+  let lastProactiveAt;
   const voiceStatus = () => bot?.status() ?? offline;
+  const clearContext = () => {
+    clearTimeout(contextTimer);
+    contextTimer = undefined;
+    recentTurns = [];
+    contextChannel = null;
+    lastProactiveAt = undefined;
+  };
+  const expireContext = () => {
+    clearTimeout(contextTimer);
+    const now = conversationNow();
+    recentTurns = recentTurns.filter((turn) => now - turn.at < 90_000);
+    contextTimer = recentTurns.length ? setTimeout(expireContext, Math.max(1, recentTurns[0].at + 90_000 - now)) : undefined;
+    contextTimer?.unref();
+  };
+  const syncContext = () => {
+    const status = voiceStatus();
+    if (!status.listening || !status.channelId || !status.people || status.channelId !== contextChannel) {
+      clearContext();
+      if (status.listening && status.channelId && status.people) contextChannel = status.channelId;
+    }
+  };
+  const cancelProactive = () => {
+    if (!job?.proactive) return;
+    const current = job;
+    job = undefined;
+    current.controller.abort();
+  };
   const cancelBroadcast = () => {
     if (job?.broadcast) job.controller.abort();
+    clearContext();
     hangout?.changed();
   };
   const cancelSpoken = () => {
     if (job?.speaker) job.controller.abort();
+    clearContext();
     listenError = '';
   };
 
-  async function runReply(input, { broadcast, speaker = null, controller, nameRequired = false, overlap, draftSettings }) {
+  async function runReply(input, { broadcast, speaker = null, controller, nameRequired = false, overlap, draftSettings, relevantMode = false }) {
     const applied = draftSettings ?? settings;
     const { signal } = controller;
-    const current = { broadcast, speaker, controller, checkingSpeech: nameRequired || Boolean(overlap) };
+    const current = { broadcast, speaker, controller, proactive: relevantMode, checkingSpeech: nameRequired || Boolean(overlap) || relevantMode };
     job = current;
     try {
       if (current.checkingSpeech) {
@@ -113,19 +151,53 @@ export async function createControlServer({
           throw new RequestError(503, 'Could not check who was being addressed. Try again when the local model is available.');
         }
         signal.throwIfAborted();
-        const called = addressedRequest(transcript);
+        const called = addressedRequest(transcript, applied.aliases);
+        if (called !== null) current.proactive = false;
+        let previous = [];
+        let latest;
+        if (relevantMode) {
+          const now = conversationNow();
+          recentTurns = recentTurns.filter((turn) => now - turn.at < 90_000);
+          previous = recentTurns.map(({ speaker: name, text }) => ({ speaker: name, text }));
+          latest = { speaker: String(speaker?.name ?? 'Someone').slice(0, 80), text: transcript.trim().slice(0, 500) };
+          if (latest.text) recentTurns = [...recentTurns, { ...latest, at: now }].slice(-4);
+          expireContext();
+        }
         if (nameRequired && called === null) return;
         if (overlap?.mode === 'addressed') overlap.stop();
         const text = called ?? transcript.trim();
         if (!text || isStopRequest(text)) return;
-        input = { text, speaker };
+        if (relevantMode && called === null) {
+          const status = voiceStatus();
+          if (status.voice !== 'ready' || !status.listening || !status.people || status.speaking || status.capturing) return;
+          if (lastProactiveAt !== undefined && conversationNow() - lastProactiveAt < applied.relevantInterval * 1000) return;
+          current.proactive = true;
+          current.checkingRelevance = true;
+          let relevant;
+          try { relevant = await decideRelevance(modelPort, { recent: previous, latest }, signal); }
+          catch {
+            if (signal.aborted) signal.throwIfAborted();
+            throw new RequestError(503, 'Could not decide whether to join the conversation. Check the local model.');
+          }
+          signal.throwIfAborted();
+          current.checkingRelevance = false;
+          if (!relevant) return;
+          input = { text, speaker, context: previous };
+        } else {
+          input = { text, speaker };
+        }
         current.checkingSpeech = false;
       }
       const reply = await synthesize(modelPort, input, applied, signal);
       if (signal.aborted) throw new RequestError(409, 'The reply was cancelled.');
       if (broadcast) {
-        try { bot.play(reply, speaker); }
+        if (current.proactive) {
+          const status = voiceStatus();
+          if (status.voice !== 'ready' || !status.listening || !status.people || status.speaking || status.capturing) return;
+        }
+        try { bot.play(reply, speaker, { proactive: current.proactive }); }
         catch (error) { throw new RequestError(409, error.message); }
+        if (current.proactive) lastProactiveAt = conversationNow();
       }
       return reply;
     } finally {
@@ -164,9 +236,10 @@ export async function createControlServer({
     const status = bot.status();
     if (status.voice !== 'ready' || (status.playing && !overlap) || !status.listening) return;
     const nameRequired = requiresAddress(settings.replyMode, status.people) || overlap?.mode === 'addressed';
+    const relevantMode = settings.replyMode === 'relevant';
     const controller = new AbortController();
     listenError = '';
-    void runReply(input, { broadcast: true, speaker: input.speaker, controller, nameRequired, overlap }).catch((error) => {
+    void runReply(input, { broadcast: true, speaker: input.speaker, controller, nameRequired, overlap, relevantMode }).catch((error) => {
       if (!controller.signal.aborted) listenError = error instanceof RequestError ? error.message : modelError;
     });
   }
@@ -176,10 +249,10 @@ export async function createControlServer({
     bot = factory(token, cancelBroadcast, {
       onUtterance, onListeningStopped: cancelSpoken, isBusy: () => Boolean(job),
       interruptionMode: () => settings.interruptions,
-      onHumanStart: (userId) => hangout?.speechStarted(userId),
+      onHumanStart: (userId) => { hangout?.speechStarted(userId); cancelProactive(); },
       onHumanSpeech: (userId) => hangout?.speechConfirmed(userId),
       onHumanEnd: (userId) => hangout?.speechEnded(userId),
-      onActivityChanged: () => hangout?.changed(),
+      onActivityChanged: () => { hangout?.changed(); syncContext(); },
     });
   }
   hangout = createHangout({
@@ -209,6 +282,7 @@ export async function createControlServer({
           const status = voiceStatus();
           return json(res, 200, {
             ...status, modelReady: ready, busy: Boolean(job), checkingSpeech: Boolean(job?.checkingSpeech),
+            checkingRelevance: Boolean(job?.checkingRelevance),
             responding: Boolean(job?.speaker && !job.checkingSpeech),
             speaker: status.speaker ?? job?.speaker ?? null, listenError, settings, lines, hangout: hangout.enabled,
           });
@@ -226,6 +300,10 @@ export async function createControlServer({
           const next = validateSettings(body, settings);
           settingsWrites = settingsWrites.catch(() => {}).then(async () => {
             await savePrompt(settingsPath, next);
+            if (settings.replyMode !== next.replyMode || settings.aliases !== next.aliases) {
+              cancelProactive();
+              clearContext();
+            }
             settings = next;
           });
           await settingsWrites;
@@ -345,6 +423,7 @@ export async function createControlServer({
   });
   server.once('listening', () => bot?.start());
   server.once('close', () => {
+    clearContext();
     hangout.close();
     job?.controller.abort();
     void bot?.close();
