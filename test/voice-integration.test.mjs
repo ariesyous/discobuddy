@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { assembleInstructions, countPromptTokens } from '../discord-control/audio.mjs';
+import { assembleInstructions, countPromptTokens, generateLine } from '../discord-control/audio.mjs';
 import { RealtimeSession } from '../local-chat/realtime.mjs';
 
 const server = process.env.DISCOBUDDY_TEST_URL;
@@ -122,4 +122,16 @@ test('real local model handles a spoken turn with a 1,500-token prompt', {
   } finally {
     chat.close();
   }
+});
+
+test('real local model synthesizes a saved line directly', {
+  skip: !server && 'Set DISCOBUDDY_TEST_URL to a running local Voice Lab server.',
+  timeout: 120_000,
+}, async () => {
+  const base = new URL(server);
+  const port = Number(base.port || (base.protocol === 'https:' ? 443 : 80));
+  const request = (url, options) => fetch(new URL(new URL(url).pathname, base), options);
+  const result = await generateLine(port, 'What game could you play forever?', { voice: 'live', speed: 1 }, new AbortController().signal, request);
+  assert.equal(result.rate, 24_000);
+  assert.ok(Buffer.concat(result.audio).length > result.rate, 'The saved line should contain audible speech.');
 });

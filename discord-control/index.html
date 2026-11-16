@@ -37,6 +37,8 @@
           <option value="any">On any sustained speech</option>
           <option value="finish">Finish each reply</option>
         </select>
+        <label class="hangout-toggle" for="hangout"><input id="hangout" type="checkbox" disabled> Hangout mode</label>
+        <p class="small">After a quiet moment, say one saved joke or question. Human speech always takes priority.</p>
         <details class="guideline-editor">
           <summary>Edit conversation guidelines</summary>
           <label for="guidelines">Instructions for replies</label>
@@ -101,6 +103,22 @@
             <p id="listen-error" class="small activity" data-error="true" role="alert" hidden></p>
           </div>
         </section>
+
+        <form id="line-bank" class="persona" aria-labelledby="line-bank-title">
+          <div class="overline">HANGOUT</div>
+          <h2 id="line-bank-title">Jokes and questions</h2>
+          <p>Add one short line per row, then save it on this PC. Each line is used at most once per hangout.</p>
+          <label for="lines">Saved lines</label>
+          <textarea id="lines" rows="6" maxlength="12000" placeholder="What game could you play forever?&#10;Why did the...?"></textarea>
+          <div class="actions"><button id="save-lines" class="primary" disabled>Save lines</button></div>
+          <p id="lines-status" class="small activity" role="status">Waiting for the panel.</p>
+          <label for="line-select">Preview a saved line</label>
+          <select id="line-select" disabled><option value="">No saved lines</option></select>
+          <div class="actions"><button id="line-preview" class="secondary" type="button" disabled>Generate line preview</button></div>
+          <p class="small">Lines use the selected TTS voice; Original live voice uses the female TTS voice for lines.</p>
+          <p id="line-activity" class="small activity" role="status"></p>
+          <audio id="line-audio" controls preload="none" hidden></audio>
+        </form>
 
         <form id="speech" class="persona" aria-labelledby="speech-title">
           <div class="overline">LOCAL MODEL · LFM3-AUDIO-2B</div>

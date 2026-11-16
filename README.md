@@ -68,6 +68,10 @@ Under **Conversation**, choose **When to reply** and **Interrupt replies** separ
 
 Open **Edit conversation guidelines** to change how replies are phrased. The defaults lead with the answer, skip routine greetings, and keep replies short. Select **Apply settings** to use the changes for the next turn. When the panel checks who was addressed, the local model transcribes the turn in memory. Audio and transcripts are not saved. Each reply starts fresh.
 
+Under **Jokes and questions**, enter one line per row and save the list. The panel stores it locally in `.local-runtime/discord-lines.json`. Select a saved line and generate a preview to hear the exact wording sent to speech synthesis. Scripted lines use the selected female or male TTS voice; when **Original live voice** is selected, they use the female TTS voice because the live voice is conversational.
+
+**Hangout mode** is a separate, opt-in switch and starts off each time the panel launches. When the bot is connected, listening, and at least one person is in the channel, it picks an unused saved line after about 90 seconds of quiet. It waits for a person to speak before starting another lull timer. Lines are chosen in random order and used at most once until the mode is turned off, the channel becomes empty, or the bot changes channels. Stopping listening pauses the current hangout without resetting used lines. Human speech cancels a line being generated and interrupts a playing Hangout line, regardless of the normal reply-interruption setting.
+
 The panel binds to loopback, and there is no public endpoint or tunnel to configure. The bot uses the standard Guilds and Guild Voice States Gateway intents. [Discord voice](https://docs.discord.com/developers/topics/voice-connections) uses a separate voice WebSocket and UDP and requires DAVE end-to-end encryption for regular voice channels. The pinned `@discordjs/voice` release handles DAVE negotiation. If the bot connects to Discord but cannot join voice, verify that the network allows Discord's voice UDP traffic. The test server is needed to verify the real handshake and playback.
 
 ### Hands-free latency

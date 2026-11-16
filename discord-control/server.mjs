@@ -3,7 +3,9 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { presets } from '../local-chat/personas.mjs';
 import { VOICES } from '../local-chat/realtime.mjs';
-import { countPromptTokens, generateReply, previewWave, transcribeAudio } from './audio.mjs';
+import { countPromptTokens, generateLine, generateReply, previewWave, transcribeAudio } from './audio.mjs';
+import { createHangout } from './hangout.mjs';
+import { loadLines, parseLines, saveLines } from './lines.mjs';
 import { loadPrompt, savePrompt } from './prompt-settings.mjs';
 import {
   addressedRequest, defaultConversation, interruptionModes, isStopRequest, MAX_PROMPT_FIELD, PROMPT_TOKEN_BUDGET, replyModes, requiresAddress,
@@ -73,17 +75,25 @@ function validateSettings(body, current) {
 }
 
 export async function createControlServer({
-  modelPort = 8765, token = '', synthesize = generateReply, transcribe = transcribeAudio, makeBot,
+  modelPort = 8765, token = '', synthesize = generateReply, synthesizeLine = generateLine, transcribe = transcribeAudio, makeBot,
   countTokens = countPromptTokens,
-  settingsPath = fileURLToPath(new URL('../.local-runtime/discord-prompt.json', import.meta.url)),
+  linesPath = fileURLToPath(new URL('../.local-runtime/discord-lines.json', import.meta.url)),
+  settingsPath = fileURLToPath(new URL('../.local-runtime/discord-prompt.json', import.meta.url)), hangoutOptions = {},
 } = {}) {
   let settings = { persona: presets.buddy, voice: 'live', speed: 1, ...defaultConversation, ...await loadPrompt(settingsPath) };
+  let lines = await loadLines(linesPath);
+  let lineWrites = Promise.resolve();
   let settingsWrites = Promise.resolve();
   let job;
   let joining = false;
   let bot;
+  let hangout;
   let listenError = '';
-  const cancelBroadcast = () => { if (job?.broadcast) job.controller.abort(); };
+  const voiceStatus = () => bot?.status() ?? offline;
+  const cancelBroadcast = () => {
+    if (job?.broadcast) job.controller.abort();
+    hangout?.changed();
+  };
   const cancelSpoken = () => {
     if (job?.speaker) job.controller.abort();
     listenError = '';
@@ -92,9 +102,10 @@ export async function createControlServer({
   async function runReply(input, { broadcast, speaker = null, controller, nameRequired = false, overlap, draftSettings }) {
     const applied = draftSettings ?? settings;
     const { signal } = controller;
-    job = { broadcast, speaker, controller, checkingSpeech: nameRequired || Boolean(overlap) };
+    const current = { broadcast, speaker, controller, checkingSpeech: nameRequired || Boolean(overlap) };
+    job = current;
     try {
-      if (job.checkingSpeech) {
+      if (current.checkingSpeech) {
         let transcript;
         try { transcript = await transcribe(modelPort, input, signal); }
         catch {
@@ -108,7 +119,7 @@ export async function createControlServer({
         const text = called ?? transcript.trim();
         if (!text || isStopRequest(text)) return;
         input = { text, speaker };
-        job.checkingSpeech = false;
+        current.checkingSpeech = false;
       }
       const reply = await synthesize(modelPort, input, applied, signal);
       if (signal.aborted) throw new RequestError(409, 'The reply was cancelled.');
@@ -118,7 +129,33 @@ export async function createControlServer({
       }
       return reply;
     } finally {
-      job = undefined;
+      if (job === current) job = undefined;
+      hangout?.changed();
+    }
+  }
+
+  async function runLine(line, { broadcast = false, controller, hangoutLine = false } = {}) {
+    const initial = voiceStatus();
+    if (job || initial.capturing || (broadcast && (initial.voice !== 'ready' || initial.playing))) return false;
+    const current = { broadcast, controller, hangoutLine };
+    job = current;
+    const release = () => { if (hangoutLine && job === current) job = undefined; };
+    controller.signal.addEventListener('abort', release, { once: true });
+    try {
+      const reply = await synthesizeLine(modelPort, line, settings, controller.signal);
+      controller.signal.throwIfAborted();
+      if (broadcast) {
+        const status = voiceStatus();
+        if (status.voice !== 'ready' || status.channelId !== initial.channelId || status.playing || status.capturing ||
+            (hangoutLine && (!hangout.enabled || !status.listening || !status.people))) return false;
+        bot.play(reply, null, { hangout: hangoutLine });
+        return true;
+      }
+      return reply;
+    } finally {
+      controller.signal.removeEventListener('abort', release);
+      if (job === current) job = undefined;
+      hangout?.changed();
     }
   }
 
@@ -139,9 +176,20 @@ export async function createControlServer({
     bot = factory(token, cancelBroadcast, {
       onUtterance, onListeningStopped: cancelSpoken, isBusy: () => Boolean(job),
       interruptionMode: () => settings.interruptions,
+      onHumanStart: (userId) => hangout?.speechStarted(userId),
+      onHumanSpeech: (userId) => hangout?.speechConfirmed(userId),
+      onHumanEnd: (userId) => hangout?.speechEnded(userId),
+      onActivityChanged: () => hangout?.changed(),
     });
   }
-  const voiceStatus = () => bot?.status() ?? offline;
+  hangout = createHangout({
+    ...hangoutOptions,
+    getStatus: () => ({ ...voiceStatus(), busy: Boolean(job) }),
+    getLines: () => lines,
+    playLine: (line, controller) => runLine(line, { broadcast: true, controller, hangoutLine: true }),
+    stopLine: () => bot?.stopHangout?.(),
+    onError: () => { listenError = modelError; },
+  });
   const modelReady = () => fetch(`http://${host}:${modelPort}/health`, { signal: AbortSignal.timeout(1500) })
     .then(async (response) => response.ok && (await response.json()).status === 'ok').catch(() => false);
 
@@ -162,7 +210,7 @@ export async function createControlServer({
           return json(res, 200, {
             ...status, modelReady: ready, busy: Boolean(job), checkingSpeech: Boolean(job?.checkingSpeech),
             responding: Boolean(job?.speaker && !job.checkingSpeech),
-            speaker: status.speaker ?? job?.speaker ?? null, listenError, settings,
+            speaker: status.speaker ?? job?.speaker ?? null, listenError, settings, lines, hangout: hangout.enabled,
           });
         }
         const asset = assets.get(path);
@@ -193,8 +241,49 @@ export async function createControlServer({
             throw new RequestError(503, 'Could not count prompt tokens. Start the local model and try again.');
           }
         }
+        if (path === '/api/lines') {
+          let next;
+          try { next = parseLines(body.text); }
+          catch (error) { throw new RequestError(400, error.message); }
+          lineWrites = lineWrites.catch(() => {}).then(async () => {
+            await saveLines(linesPath, next);
+            lines = next;
+            hangout.bankChanged();
+          });
+          await lineWrites;
+          return json(res, 200, { lines });
+        }
+        if (path === '/api/hangout') {
+          if (typeof body.enabled !== 'boolean') throw new RequestError(400, 'Choose whether to enable Hangout mode.');
+          hangout.setEnabled(body.enabled);
+          listenError = '';
+          return json(res, 200, { enabled: hangout.enabled });
+        }
+        if (path === '/api/line-preview') {
+          if (!Number.isInteger(body.index) || body.index < 0 || body.index >= lines.length) {
+            throw new RequestError(400, 'Choose a saved line to preview.');
+          }
+          if (body.line !== lines[body.index]) throw new RequestError(409, 'The saved lines changed. Choose a line again.');
+          if (job || voiceStatus().capturing) throw new RequestError(409, 'Wait for the current turn to finish.');
+          const controller = new AbortController();
+          const cancel = () => controller.abort();
+          res.once('close', cancel);
+          try {
+            const reply = await runLine(lines[body.index], { controller });
+            if (!reply) throw new RequestError(409, 'Wait for the current turn to finish.');
+            const wav = Buffer.from(await previewWave(reply));
+            return res.writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Length': wav.length }).end(wav);
+          } catch (error) {
+            if (error instanceof RequestError) throw error;
+            if (controller.signal.aborted) throw new RequestError(409, 'The preview was cancelled.');
+            throw new RequestError(503, modelError);
+          } finally {
+            res.off('close', cancel);
+          }
+        }
         if (path === '/api/leave') {
           bot?.leave();
+          hangout.changed();
           return json(res, 200, { ok: true });
         }
         if (path === '/api/listen') {
@@ -202,6 +291,7 @@ export async function createControlServer({
           if (typeof body.enabled !== 'boolean') throw new RequestError(400, 'Choose whether to enable listening.');
           try { bot.setListening(body.enabled); }
           catch (error) { throw new RequestError(409, error.message); }
+          hangout.changed();
           return json(res, 200, { ok: true });
         }
         if (path === '/api/join') {
@@ -217,6 +307,7 @@ export async function createControlServer({
           try { await bot.join(body.channelId, { listening: body.listening }); }
           catch (error) { throw new RequestError(409, error.message); }
           finally { joining = false; }
+          hangout.changed();
           return json(res, 200, { ok: true });
         }
         if (path === '/api/preview' || path === '/api/speak') {
@@ -254,6 +345,7 @@ export async function createControlServer({
   });
   server.once('listening', () => bot?.start());
   server.once('close', () => {
+    hangout.close();
     job?.controller.abort();
     void bot?.close();
   });
